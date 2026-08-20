@@ -1,0 +1,67 @@
+digraph ControlLoop {
+    rankdir=LR;
+    node [shape=box, style=filled, fillcolor=white, fontname="Helvetica"];
+    edge [fontname="Helvetica", fontsize=10];
+    compound=true;
+    fontname="Helvetica";
+    bgcolor="transparent";
+
+    subgraph cluster_sim_process {
+        label = "Simulation Process";
+        style=filled;
+        fillcolor="#e1f5fe";
+        color="#01579b";
+
+        isaac [label="Isaac Sim\n(Physics)", shape=cylinder, fillcolor="#b3e5fc"];
+        dog_runner [label="DogRunner", fillcolor="#b3e5fc"];
+        ros_bridge [label="RosMpcController", fillcolor="#b3e5fc"];
+
+        isaac -> dog_runner [label="1. Get State\n(Joints, IMU)"];
+        dog_runner -> ros_bridge [label="2. Publish State"];
+        ros_bridge -> dog_runner [label="13. Get Action\n(Torques)"];
+        dog_runner -> isaac [label="14. Apply Torques"];
+    }
+
+    subgraph cluster_ros {
+        label = "ROS 2 Middleware";
+        style=filled;
+        fillcolor="#fff3e0";
+        color="#e65100";
+
+        topic_state [label="/dls2/base_state\n/dls2/blind_state", shape=note, fillcolor="#ffe0b2"];
+        topic_cmd [label="/dls2/quadruped_pympc_torques", shape=note, fillcolor="#ffe0b2"];
+    }
+
+    subgraph cluster_ctrl_process {
+        label = "Controller Process";
+        style=filled;
+        fillcolor="#e8f5e9";
+        color="#1b5e20";
+
+        mpc_node [label="Quadruped_PyMPC_Node", fillcolor="#c8e6c9"];
+        
+        subgraph cluster_logic {
+            label = "Control Logic";
+            style=dashed;
+            color="#2e7d32";
+
+            wb_interface [label="WBInterface\n(State Est & Ref)", fillcolor="#a5d6a7"];
+            srbd [label="SRBDControllerInterface", fillcolor="#a5d6a7"];
+            solver [label="Acados Solver\n(NMPC)", shape=component, fillcolor="#81c784"];
+            torque_gen [label="Torque Generation\n(Jacobian Transpose)", fillcolor="#a5d6a7"];
+        }
+
+        mpc_node -> wb_interface [label="5. Update State\n& Reference"];
+        mpc_node -> srbd [label="6. Compute Control\n(using WB outputs)"];
+        srbd -> solver [label="7. Solve OCP"];
+        solver -> srbd [label="8. Optimal GRFs"];
+        srbd -> mpc_node [label="9. Return GRFs"];
+        mpc_node -> torque_gen [label="10. Compute Torques"];
+    }
+
+    ros_bridge -> topic_state [label="3. Publish"];
+    topic_state -> mpc_node [label="4. Subscribe"];
+
+    torque_gen -> topic_cmd [label="11. Publish"];
+    topic_cmd -> ros_bridge [label="12. Subscribe"];
+}

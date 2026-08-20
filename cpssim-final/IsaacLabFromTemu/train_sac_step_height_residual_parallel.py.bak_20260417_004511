@@ -1,0 +1,794 @@
+from __future__ import annotations
+
+import os
+import queue
+import random
+import sys
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any
+
+import multiprocessing as mp
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+
+project_root = os.path.abspath(os.path.dirname(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from src.dog.isaac_step_height_residual_env import IsaacStepHeightResidualEnv
+from train_sac_step_height_residual import Actor, Args as BaseArgs, ReplayBuffer, SoftQNetwork
+
+
+def _build_env_kwargs(base: BaseArgs) -> dict[str, Any]:
+    return dict(
+        headless=base.headless,
+        frame_skip=base.frame_skip,
+        episode_length=base.episode_length,
+        command_forward=base.command_forward,
+        command_lateral=base.command_lateral,
+        command_yaw=0.0 if (base.use_two_stage_curriculum or base.use_six_stage_curriculum) else base.command_yaw,
+        command_pitch=base.command_pitch,
+        use_two_stage_curriculum=base.use_two_stage_curriculum,
+        use_six_stage_curriculum=base.use_six_stage_curriculum,
+        stair_start_x=base.stair_start_x,
+        curriculum_stage_1_min=base.curriculum_stage_1_min,
+        curriculum_stage_1_max=base.curriculum_stage_1_max,
+        curriculum_stage_2_min=base.curriculum_stage_2_min,
+        curriculum_stage_2_max=base.curriculum_stage_2_max,
+        curriculum_stage_3_min=base.curriculum_stage_3_min,
+        curriculum_stage_3_max=base.curriculum_stage_3_max,
+        curriculum_stage_4_min=base.curriculum_stage_4_min,
+        curriculum_stage_4_max=base.curriculum_stage_4_max,
+        curriculum_stage_5_min=base.curriculum_stage_5_min,
+        curriculum_stage_5_max=base.curriculum_stage_5_max,
+        curriculum_stage_6_min=base.curriculum_stage_6_min,
+        curriculum_stage_6_max=base.curriculum_stage_6_max,
+        curriculum_early_stair_start_x_min=base.curriculum_early_stair_start_x_min,
+        curriculum_early_stair_start_x_max=base.curriculum_early_stair_start_x_max,
+        curriculum_early_stair_height_min=base.curriculum_early_stair_height_min,
+        curriculum_early_stair_height_max=base.curriculum_early_stair_height_max,
+        curriculum_late_stair_start_x_min=base.curriculum_late_stair_start_x_min,
+        curriculum_late_stair_start_x_max=base.curriculum_late_stair_start_x_max,
+        curriculum_late_stair_height_min=base.curriculum_late_stair_height_min,
+        curriculum_late_stair_height_max=base.curriculum_late_stair_height_max,
+        curriculum_success_threshold=base.curriculum_success_threshold,
+        curriculum_window_episodes=base.curriculum_window_episodes,
+        curriculum_progression_criterion=base.curriculum_progression_criterion,
+        speed_curriculum_enabled=base.speed_curriculum_enabled,
+        speed_curriculum_min=base.speed_curriculum_min,
+        speed_curriculum_max=base.speed_curriculum_max,
+        speed_curriculum_warmup_episodes=base.speed_curriculum_warmup_episodes,
+        speed_curriculum_full_episodes=base.speed_curriculum_full_episodes,
+        random_command_enabled=base.random_command_enabled,
+        random_command_min=base.random_command_min,
+        random_command_max=base.random_command_max,
+        randomize_stairs=base.randomize_stairs,
+        stair_start_x_min=base.stair_start_x_min,
+        stair_start_x_max=base.stair_start_x_max,
+        stair_step_height_min=base.stair_step_height_min,
+        stair_step_height_max=base.stair_step_height_max,
+        stair_step_width_min=base.stair_step_width_min,
+        stair_step_width_max=base.stair_step_width_max,
+        stair_num_steps_up_min=base.stair_num_steps_up_min,
+        stair_num_steps_up_max=base.stair_num_steps_up_max,
+        stair_num_steps_down_min=base.stair_num_steps_down_min,
+        stair_num_steps_down_max=base.stair_num_steps_down_max,
+        stair_equal_up_down_steps=base.stair_equal_up_down_steps,
+        residual_warmup_steps=base.residual_warmup_steps,
+        residual_ramp_steps=base.residual_ramp_steps,
+        overspeed_terminate_mps=base.overspeed_terminate_mps,
+        hard_attitude_terminate_rad=base.hard_attitude_terminate_rad,
+        hard_attitude_violation_steps=base.hard_attitude_violation_steps,
+        base_height_terminate=base.base_height_terminate,
+        base_height_grace=base.base_height_grace,
+        command_ramp_steps=base.command_ramp_steps,
+        startup_max_cmd_mps=base.startup_max_cmd_mps,
+        startup_torque_scale_steps=base.startup_torque_scale_steps,
+        startup_torque_scale=base.startup_torque_scale,
+        fixed_course=base.fixed_course,
+        learning_starts_steps=base.learning_starts,
+    )
+
+
+def _to_cpu_state_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {k: v.detach().cpu() for k, v in module.state_dict().items()}
+
+
+@dataclass
+class ParallelArgs:
+    base: BaseArgs = field(default_factory=BaseArgs)
+
+    # Parallel actor-learner settings
+    num_actors: int = 10
+    # IMPORTANT: keep this at 1 for Isaac. Each actor already owns one process,
+    # and setting >1 here creates nested process-vectorization inside each actor,
+    # which usually hurts SPS due to extra IPC and runtime contention.
+    num_envs_per_actor: int = 1
+    # Larger fragments reduce queue traffic and Python overhead per env step.
+    rollout_fragment_steps: int = 256
+    # Fewer learner updates per fragment improves env-step throughput (SPS).
+    learner_updates_per_batch: int = 2
+    # Broadcast less frequently to reduce weight-transfer overhead.
+    policy_broadcast_interval_updates: int = 25
+    # Slightly larger queue helps smooth producer/consumer bursts.
+    transition_queue_size: int = 128
+    actor_seed_stride: int = 1000
+    # Stagger actor startups to avoid ACADOS compile storms and Isaac init spikes.
+    actor_start_stagger_sec: float = 1.5
+
+    # Logging / run naming
+    run_name: str = "sac_step_height_residual_parallel"
+
+
+class ActorProcessPayload(dict):
+    pass
+
+
+def _replay_add_batch(rb: ReplayBuffer, obs_np, next_obs_np, act_np, rew_np, done_np) -> int:
+    """Insert a whole actor payload into replay with vectorized writes.
+
+    This avoids Python per-transition loops on the learner side, which directly
+    improves SPS when actor payloads are large.
+    """
+    n = int(obs_np.shape[0])
+    if n <= 0:
+        return 0
+
+    cap = int(rb.capacity)
+    ptr = int(rb.ptr)
+    first = min(n, cap - ptr)
+
+    rb.obs[ptr:ptr + first] = obs_np[:first]
+    rb.next_obs[ptr:ptr + first] = next_obs_np[:first]
+    rb.actions[ptr:ptr + first] = act_np[:first]
+    rb.rewards[ptr:ptr + first] = rew_np[:first]
+    rb.dones[ptr:ptr + first] = done_np[:first]
+
+    if n > first:
+        rem = n - first
+        rb.obs[:rem] = obs_np[first:first + rem]
+        rb.next_obs[:rem] = next_obs_np[first:first + rem]
+        rb.actions[:rem] = act_np[first:first + rem]
+        rb.rewards[:rem] = rew_np[first:first + rem]
+        rb.dones[:rem] = done_np[first:first + rem]
+
+    rb.ptr = (ptr + n) % cap
+    rb.size = min(cap, int(rb.size) + n)
+    return n
+
+
+def _run_actor(
+    actor_id: int,
+    base_args_dict: dict[str, Any],
+    env_kwargs: dict[str, Any],
+    num_envs_per_actor: int,
+    rollout_fragment_steps: int,
+    random_explore_steps_per_actor: int,
+    actor_seed_stride: int,
+    transition_queue: mp.Queue,
+    metric_queue: mp.Queue,
+    weights_queue: mp.Queue,
+    stop_event: Any,
+) -> None:
+    print(f"[{os.getpid()}] Actor {actor_id} started.", flush=True)
+    base = BaseArgs(**base_args_dict)
+
+    # Avoid per-process CPU oversubscription when many actors are active.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+    random.seed(base.seed + actor_seed_stride * actor_id)
+    np.random.seed(base.seed + actor_seed_stride * actor_id)
+    torch.manual_seed(base.seed + actor_seed_stride * actor_id)
+
+    env = IsaacStepHeightResidualEnv.make_env(num_envs=num_envs_per_actor, **env_kwargs)
+    is_vector_env = hasattr(env, "single_observation_space") and hasattr(env, "single_action_space")
+
+    if is_vector_env:
+        obs_space = env.single_observation_space
+        act_space = env.single_action_space
+    else:
+        # With the SPS fix we intentionally run 1 env per actor; in this mode
+        # make_env returns a plain single env, not a vector wrapper.
+        if int(num_envs_per_actor) != 1:
+            raise RuntimeError("single-env actor path requires num_envs_per_actor == 1")
+        obs_space = env.observation_space
+        act_space = env.action_space
+
+    obs_dim = int(np.prod(obs_space.shape))
+    act_dim = int(np.prod(act_space.shape))
+    actor = Actor(obs_dim, act_space.low, act_space.high).cpu()
+    actor.eval()
+
+    first_weights = weights_queue.get()
+    actor.load_state_dict(first_weights)
+
+    obs, _ = env.reset(seed=base.seed + actor_seed_stride * actor_id)
+    if not is_vector_env:
+        obs = np.asarray(obs, dtype=np.float32).reshape(1, -1)
+    local_env_steps = 0
+    episodic_return = np.zeros((num_envs_per_actor,), dtype=np.float64)
+    episodic_length = np.zeros((num_envs_per_actor,), dtype=np.int32)
+
+    def _extract_env_info_for_metric(info_obj: Any, env_idx: int) -> dict[str, Any]:
+        if isinstance(info_obj, dict):
+            if env_idx != 0:
+                return {}
+            return dict(info_obj)
+        if not isinstance(info_obj, (list, tuple)):
+            return {}
+        if env_idx >= len(info_obj):
+            return {}
+        env_info = info_obj[env_idx]
+        if not isinstance(env_info, dict):
+            return {}
+
+        out: dict[str, Any] = {}
+        final_info = env_info.get("final_info")
+        if isinstance(final_info, dict):
+            out.update(final_info)
+        for k, v in env_info.items():
+            if k in {"final_info", "final_observation", "reset_info"}:
+                continue
+            if isinstance(v, (int, float, np.floating, np.integer, bool, str)):
+                out[k] = v
+        return out
+
+    try:
+        while not stop_event.is_set():
+            rollout_t0 = time.perf_counter()
+            # Keep only the latest policy snapshot to reduce staleness.
+            while True:
+                try:
+                    newer = weights_queue.get_nowait()
+                    actor.load_state_dict(newer)
+                except queue.Empty:
+                    break
+
+            obs_batch = []
+            act_batch = []
+            rew_batch = []
+            done_batch = []
+            next_obs_batch = []
+
+            for _ in range(rollout_fragment_steps):
+                if local_env_steps < random_explore_steps_per_actor:
+                    action = np.random.uniform(-1.0, 1.0, size=(num_envs_per_actor, act_dim)).astype(np.float32)
+                else:
+                    with torch.no_grad():
+                        obs_t = torch.tensor(obs, dtype=torch.float32)
+                        a, _, _ = actor.get_action(obs_t)
+                    action = a.cpu().numpy().astype(np.float32)
+
+                if is_vector_env:
+                    next_obs, reward, terminated, truncated, info = env.step(action)
+                else:
+                    next_obs_s, reward_s, terminated_s, truncated_s, info_s = env.step(action[0])
+                    next_obs = np.asarray(next_obs_s, dtype=np.float32).reshape(1, -1)
+                    reward = np.asarray([reward_s], dtype=np.float32)
+                    terminated = np.asarray([terminated_s], dtype=np.bool_)
+                    truncated = np.asarray([truncated_s], dtype=np.bool_)
+                    info = [info_s]
+                done = np.logical_or(terminated, truncated)
+
+                # Single env path does not auto-reset; emulate vector worker
+                # behavior so we don't keep stepping a terminated episode.
+                if (not is_vector_env) and bool(done[0]):
+                    reset_obs_s, reset_info_s = env.reset()
+                    reset_obs = np.asarray(reset_obs_s, dtype=np.float32).reshape(1, -1)
+                    env_info = info[0] if isinstance(info, list) and len(info) > 0 and isinstance(info[0], dict) else {}
+                    info = [{
+                        **env_info,
+                        "final_observation": next_obs[0].copy(),
+                        "final_info": dict(env_info),
+                        "reset_info": reset_info_s if isinstance(reset_info_s, dict) else {},
+                    }]
+                    next_obs = reset_obs
+
+                obs_batch.append(obs.copy())
+                act_batch.append(action.copy())
+                rew_batch.append(np.asarray(reward, dtype=np.float32).reshape(-1, 1))
+                done_batch.append(done.astype(np.float32).reshape(-1, 1))
+                next_obs_batch.append(next_obs.copy())
+
+                episodic_return += np.asarray(reward, dtype=np.float64)
+                episodic_length += 1
+                for env_i in range(num_envs_per_actor):
+                    if bool(done[env_i]):
+                        metric_payload = {
+                            "actor_id": actor_id,
+                            "episodic_return": float(episodic_return[env_i]),
+                            "episodic_length": int(episodic_length[env_i]),
+                        }
+                        metric_payload.update(_extract_env_info_for_metric(info, env_i))
+                        try:
+                            metric_queue.put_nowait(metric_payload)
+                        except queue.Full:
+                            pass
+                        episodic_return[env_i] = 0.0
+                        episodic_length[env_i] = 0
+
+                obs = next_obs
+                local_env_steps += num_envs_per_actor
+
+            payload = ActorProcessPayload(
+                observations=np.concatenate(obs_batch, axis=0),
+                actions=np.concatenate(act_batch, axis=0),
+                rewards=np.concatenate(rew_batch, axis=0),
+                dones=np.concatenate(done_batch, axis=0),
+                next_observations=np.concatenate(next_obs_batch, axis=0),
+                env_steps=int(rollout_fragment_steps * num_envs_per_actor),
+                actor_rollout_sec=float(time.perf_counter() - rollout_t0),
+            )
+            put_t0 = time.perf_counter()
+            transition_queue.put(payload)
+            put_block_sec = float(time.perf_counter() - put_t0)
+            if put_block_sec > 1e-6:
+                try:
+                    metric_queue.put_nowait({
+                        "actor_id": actor_id,
+                        "actor_queue_put_block_sec": put_block_sec,
+                    })
+                except queue.Full:
+                    pass
+    finally:
+        env.close()
+
+
+def main() -> None:
+    args = ParallelArgs()
+    base = args.base
+
+    # PRE-BUILD ACADOS ONCE IN MAIN PROCESS TO PREVENT RACE CONDITIONS
+    try:
+        import sys
+        import os
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+            
+        from pympc.quadruped_pympc.controllers.gradient.nominal.centroidal_nmpc_nominal import Acados_NMPC_Nominal
+        print("[Main] Pre-building Acados OCP solver to avoid multiprocessing race conditions...", flush=True)
+        _ = Acados_NMPC_Nominal()
+        print("[Main] Acados OCP solver built successfully.", flush=True)
+    except Exception as e:
+        print(f"[Main] Warning: Could not pre-build Acados OCP. Workers may fail. {e}", flush=True)
+
+    # Keep compatibility with the updated SAC defaults unless explicitly changed.
+    random.seed(base.seed)
+    np.random.seed(base.seed)
+    torch.manual_seed(base.seed)
+    # Keep learner-side CPU thread pools bounded as actor count grows.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+    device = torch.device("cuda" if torch.cuda.is_available() and base.cuda else "cpu")
+
+    obs_dim = IsaacStepHeightResidualEnv.RL_OBS_DIM
+    act_dim = IsaacStepHeightResidualEnv.RL_ACT_DIM
+    act_low = np.full((act_dim,), -1.0, dtype=np.float32)
+    act_high = np.full((act_dim,), 1.0, dtype=np.float32)
+
+    actor = Actor(obs_dim, act_low, act_high).to(device)
+    qf1 = SoftQNetwork(obs_dim, act_dim).to(device)
+    qf2 = SoftQNetwork(obs_dim, act_dim).to(device)
+    qf1_target = SoftQNetwork(obs_dim, act_dim).to(device)
+    qf2_target = SoftQNetwork(obs_dim, act_dim).to(device)
+    qf1_target.load_state_dict(qf1.state_dict())
+    qf2_target.load_state_dict(qf2.state_dict())
+
+    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=base.q_lr)
+    actor_optimizer = optim.Adam(actor.parameters(), lr=base.policy_lr)
+
+    use_amp = bool(device.type == "cuda" and base.use_amp)
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    except (AttributeError, TypeError):
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    if base.autotune:
+        target_entropy = -float(act_dim)
+        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        log_alpha.requires_grad_(True)
+        alpha = log_alpha.exp().item()
+        alpha_floor = 0.0
+        alpha_ceiling = float(min(1.0, max(alpha_floor + 1e-6, base.alpha_ceiling)))
+        a_optimizer = optim.Adam([log_alpha], lr=base.alpha_lr)
+    else:
+        alpha = base.alpha
+        log_alpha = None
+        alpha_floor = 0.0
+        alpha_ceiling = float(min(1.0, max(alpha_floor, base.alpha_ceiling)))
+        a_optimizer = None
+
+    latest_alpha_loss = float("nan")
+    latest_policy_entropy = float("nan")
+    latest_entropy_gap = float("nan")
+    latest_log_alpha = float(log_alpha.item()) if log_alpha is not None else float("nan")
+
+    rb = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, capacity=base.buffer_size, device=device)
+
+    os.makedirs(base.log_dir, exist_ok=True)
+    os.makedirs(base.checkpoint_dir, exist_ok=True)
+    run_name = f"{args.run_name}_seed{base.seed}_{int(time.time())}"
+
+    ctx = mp.get_context("spawn")
+    transition_queue: mp.Queue = ctx.Queue(maxsize=max(8, args.transition_queue_size))
+    metric_queue: mp.Queue = ctx.Queue(maxsize=2048)
+    stop_event = ctx.Event()
+
+    env_kwargs = _build_env_kwargs(base)
+    requested_envs_per_actor = int(max(1, args.num_envs_per_actor))
+    if requested_envs_per_actor != 1:
+        print(
+            f"[PARALLEL SAC] overriding num_envs_per_actor={requested_envs_per_actor} to 1 to avoid nested Isaac vectorization and SPS collapse",
+            flush=True,
+        )
+    effective_envs_per_actor = 1
+    weights_queues = [ctx.Queue(maxsize=2) for _ in range(args.num_actors)]
+    actor_procs: list[mp.Process] = []
+
+    random_explore_steps_per_actor = int(max(1, base.learning_starts // max(1, args.num_actors)))
+
+    for actor_id in range(args.num_actors):
+        p = ctx.Process(
+            target=_run_actor,
+            args=(
+                actor_id,
+                vars(base),
+                env_kwargs,
+                int(effective_envs_per_actor),
+                int(max(1, args.rollout_fragment_steps)),
+                random_explore_steps_per_actor,
+                int(max(1, args.actor_seed_stride)),
+                transition_queue,
+                metric_queue,
+                weights_queues[actor_id],
+                stop_event,
+            ),
+            daemon=False,
+        )
+        p.start()
+        actor_procs.append(p)
+        # Sequential actor warmup reduces startup resource contention when
+        # multiple actors initialize Isaac and ACADOS at the same time.
+        if actor_id < (args.num_actors - 1) and float(args.actor_start_stagger_sec) > 0.0:
+            time.sleep(float(args.actor_start_stagger_sec))
+
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(os.path.join(base.log_dir, run_name))
+
+    init_weights = _to_cpu_state_dict(actor)
+    for wq in weights_queues:
+        wq.put(init_weights)
+
+    total_env_steps = 0
+    total_updates = 0
+    total_episodes = 0
+    start_time = time.time()
+    reached_stairs_count = 0
+    climbed_up_count = 0
+    descended_to_flat_count = 0
+    course_complete_count = 0
+    deviation_forward_count = 0
+    deviation_lateral_count = 0
+    episode_end_case_counts: dict[str, int] = defaultdict(int)
+    episode_end_type_counts: dict[str, int] = defaultdict(int)
+    actor_rollout_sec_sum = 0.0
+    actor_put_block_sec_sum = 0.0
+    payload_count = 0
+    learner_wait_sec_sum = 0.0
+    learner_update_sec_sum = 0.0
+
+    try:
+        while total_env_steps < base.total_timesteps:
+            wait_t0 = time.perf_counter()
+            try:
+                payload = transition_queue.get(timeout=60.0)
+            except queue.Empty:
+                dead = [p.pid for p in actor_procs if (not p.is_alive())]
+                if dead:
+                    raise RuntimeError(f"Actor process died unexpectedly: {dead}")
+                continue
+            learner_wait_sec_sum += float(time.perf_counter() - wait_t0)
+            actor_rollout_sec_sum += float(payload.get("actor_rollout_sec", 0.0))
+            payload_count += 1
+
+            obs_np = payload["observations"]
+            next_obs_np = payload["next_observations"]
+            act_np = payload["actions"]
+            rew_np = payload["rewards"]
+            done_np = payload["dones"]
+
+            batch_n = _replay_add_batch(rb, obs_np, next_obs_np, act_np, rew_np, done_np)
+            total_env_steps += int(payload.get("env_steps", batch_n))
+
+            while True:
+                try:
+                    metric = metric_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if "actor_queue_put_block_sec" in metric:
+                    actor_put_block_sec_sum += float(metric.get("actor_queue_put_block_sec", 0.0))
+                    continue
+                total_episodes += 1
+                writer.add_scalar("charts/episodic_return", float(metric["episodic_return"]), total_env_steps)
+                writer.add_scalar("charts/episodic_length", float(metric["episodic_length"]), total_env_steps)
+
+                cmd_fwd = float(metric.get("episode_command_forward", base.command_forward))
+                ret_norm_cmd = float(metric["episodic_return"]) / float(max(float(metric["episodic_length"]), 1.0) * max(abs(cmd_fwd), 0.4))
+                writer.add_scalar("charts/episodic_return_norm_cmd", ret_norm_cmd, total_env_steps)
+
+                stair_reached = float(metric.get("episode_reached_stairs", 0.0))
+                climbed_up = float(metric.get("episode_climbed_up", 0.0))
+                descended_to_flat = float(metric.get("episode_descended_to_flat", 0.0))
+                course_success = float(metric.get("episode_course_success", 0.0))
+                course_complete = float(metric.get("episode_course_complete", 0.0))
+                reached_stairs_count += int(stair_reached > 0.5)
+                climbed_up_count += int(climbed_up > 0.5)
+                descended_to_flat_count += int(descended_to_flat > 0.5)
+                course_complete_count += int(course_complete > 0.5)
+
+                episode_end_reason = str(metric.get("episode_end_reason", "unknown"))
+                episode_termination_reason = str(metric.get("episode_termination_reason", metric.get("termination_reason", "none")))
+                if episode_end_reason == "truncated":
+                    case_key = "truncated/episode_length"
+                else:
+                    case_key = f"terminated/{episode_termination_reason}"
+                episode_end_case_counts[case_key] += 1
+                episode_end_type_counts[episode_end_reason] += 1
+
+                if episode_termination_reason == "deviation":
+                    if float(metric.get("deviation_forward_bypass", 0.0)) > 0.5:
+                        deviation_forward_count += 1
+                    if float(metric.get("deviation_lateral_bypass", 0.0)) > 0.5:
+                        deviation_lateral_count += 1
+
+                # Episode-level metrics mirrored from the single-process trainer.
+                for k in (
+                    "episode_max_x",
+                    "episode_max_z",
+                    "episode_start_z",
+                    "episode_command_forward",
+                    "episode_stair_start_x",
+                    "episode_stair_step_height",
+                    "episode_stair_step_width",
+                    "episode_stair_num_steps_up",
+                    "episode_stair_num_steps_down",
+                    "episode_curriculum_stage",
+                    "episode_curriculum_two_stage_success_rate",
+                    "episode_curriculum_recent_success_rate",
+                    "episode_curriculum_success_threshold_effective",
+                    "episode_curriculum_window_episodes_effective",
+                    "episode_curriculum_progression_criterion_is_complete",
+                    "episode_curriculum_progression_success",
+                    "episode_completion_steps",
+                    "episode_time_to_complete_s",
+                    "episode_course_end_x",
+                    "episode_max_abs_yaw_error",
+                    "episode_mpc_maxiter_count",
+                    "episode_mpc_minstep_count",
+                    "episode_mpc_failure_count",
+                ):
+                    if k in metric:
+                        writer.add_scalar(f"episode/{k.replace('episode_', '')}", float(metric[k]), total_env_steps)
+
+                writer.add_scalar("episode/climbed_up", climbed_up, total_env_steps)
+                writer.add_scalar("episode/descended_to_flat", descended_to_flat, total_env_steps)
+                writer.add_scalar("episode/course_success", course_success, total_env_steps)
+                writer.add_scalar("episode/course_complete", course_complete, total_env_steps)
+                writer.add_scalar("episode/success_rate_reached", reached_stairs_count / max(total_episodes, 1), total_env_steps)
+                writer.add_scalar("episode/success_rate_climbed", climbed_up_count / max(total_episodes, 1), total_env_steps)
+                writer.add_scalar("episode/course_complete_rate", course_complete_count / max(total_episodes, 1), total_env_steps)
+                writer.add_scalar("episode_end_counts/terminated_total", float(episode_end_type_counts['terminated']), total_env_steps)
+                writer.add_scalar("episode_end_counts/truncated_total", float(episode_end_type_counts['truncated']), total_env_steps)
+                writer.add_scalar("episode_end_counts/course_complete", float(course_complete_count), total_env_steps)
+                writer.add_scalar("episode_end_counts/deviation_lateral", float(deviation_lateral_count), total_env_steps)
+                if case_key not in ("terminated/base_height", "terminated/deviation"):
+                    writer.add_scalar(f"episode_end_counts/{case_key}", float(episode_end_case_counts[case_key]), total_env_steps)
+
+                # Per-episode decomposed reward sums.
+                for key, value in metric.items():
+                    if isinstance(key, str) and key.startswith("reward_comp_sum_"):
+                        component_name = key.replace("reward_comp_sum_", "")
+                        if component_name == "total_reward":
+                            continue
+                        writer.add_scalar(f"episode/reward_component_sum/{component_name}", float(value), total_env_steps)
+
+                # Step-level env and MPC diagnostics at episode boundary.
+                for key, tag in (
+                    ("tracking_error", "env/tracking_error"),
+                    ("base_z", "env/base_z"),
+                    ("base_x", "env/base_x"),
+                    ("base_roll", "env/base_roll"),
+                    ("base_pitch", "env/base_pitch"),
+                    ("step_height_effective", "env/step_height_effective"),
+                    ("residual_m", "env/residual_m"),
+                    ("swing_time_s", "env/swing_time_s"),
+                    ("residual_gate", "env/residual_gate"),
+                    ("forward_tracking_reward", "env/forward_tracking_reward"),
+                    ("yaw_tracking_reward", "env/yaw_tracking_reward"),
+                    ("orientation_penalty", "env/orientation_penalty"),
+                ):
+                    if key in metric:
+                        writer.add_scalar(tag, float(metric[key]), total_env_steps)
+
+                for key, tag in (
+                    ("mpc_status", "mpc/status"),
+                    ("mpc_compute_ms", "mpc/compute_ms"),
+                    ("mpc_torque_max_abs", "mpc/torque_max_abs"),
+                    ("mpc_torque_sat_ratio", "mpc/torque_sat_ratio"),
+                    ("mpc_sqp_iter", "mpc/sqp_iter"),
+                    ("mpc_qp_iter", "mpc/qp_iter"),
+                    ("mpc_qp_status", "mpc/qp_status"),
+                    ("mpc_maxiter_count_episode", "mpc/maxiter_count_episode"),
+                    ("mpc_minstep_count_episode", "mpc/minstep_count_episode"),
+                    ("mpc_failure_count_episode", "mpc/failure_count_episode"),
+                ):
+                    if key in metric:
+                        writer.add_scalar(tag, float(metric[key]), total_env_steps)
+
+            if total_env_steps > base.learning_starts and rb.size >= base.batch_size:
+                update_t0 = time.perf_counter()
+                for _ in range(int(max(1, args.learner_updates_per_batch))):
+                    # Replay sampling quality drives learning efficiency.
+                    # This is currently uniform sampling; prioritized replay can
+                    # be plugged in here to focus updates on high-TD-error data.
+                    data = rb.sample(base.batch_size)
+
+                    with torch.no_grad():
+                        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                            next_actions, next_log_pi, _ = actor.get_action(data["next_observations"])
+                            qf1_next_target = qf1_target(data["next_observations"], next_actions)
+                            qf2_next_target = qf2_target(data["next_observations"], next_actions)
+                            min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_log_pi
+                            scaled_rewards = data["rewards"] * float(base.reward_scale)
+                            next_q_value = scaled_rewards + (1.0 - data["dones"]) * base.gamma * min_qf_next_target
+                            if float(base.target_q_clip) > 0.0:
+                                target_q_clip = float(max(1.0, base.target_q_clip))
+                                next_q_value = torch.clamp(next_q_value, -target_q_clip, target_q_clip)
+
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                        qf1_values = qf1(data["observations"], data["actions"])
+                        qf2_values = qf2(data["observations"], data["actions"])
+                        qf1_loss = F.mse_loss(qf1_values, next_q_value)
+                        qf2_loss = F.mse_loss(qf2_values, next_q_value)
+                        qf_loss = qf1_loss + qf2_loss
+
+                    q_optimizer.zero_grad(set_to_none=True)
+                    scaler.scale(qf_loss).backward()
+                    scaler.unscale_(q_optimizer)
+                    # Tighter gradient management prevents rare update spikes
+                    # from destabilizing actor/critic optimization.
+                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        list(qf1.parameters()) + list(qf2.parameters()),
+                        max_norm=float(max(0.1, base.critic_grad_clip_norm)),
+                    )
+                    scaler.step(q_optimizer)
+
+                    if total_updates % base.policy_frequency == 0:
+                        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                            pi, log_pi, _ = actor.get_action(data["observations"])
+                            qf1_pi = qf1(data["observations"], pi)
+                            qf2_pi = qf2(data["observations"], pi)
+                            min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                            actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+
+                        actor_optimizer.zero_grad(set_to_none=True)
+                        scaler.scale(actor_loss).backward()
+                        scaler.unscale_(actor_optimizer)
+                        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            actor.parameters(),
+                            max_norm=float(max(0.1, base.actor_grad_clip_norm)),
+                        )
+                        scaler.step(actor_optimizer)
+
+                        if base.autotune:
+                            with torch.no_grad():
+                                _, log_pi_new, _ = actor.get_action(data["observations"])
+                            latest_policy_entropy = float((-log_pi_new).mean().item())
+                            latest_entropy_gap = float((-(log_pi_new + target_entropy)).mean().item())
+                            alpha_loss = (-log_alpha.exp() * (log_pi_new + target_entropy)).mean()
+                            latest_alpha_loss = float(alpha_loss.item())
+                            a_optimizer.zero_grad()
+                            alpha_loss.backward()
+                            a_optimizer.step()
+                            alpha = float(np.clip(log_alpha.exp().item(), alpha_floor, alpha_ceiling))
+                            latest_log_alpha = float(log_alpha.item())
+
+                    scaler.update()
+
+                    if total_updates % base.target_network_frequency == 0:
+                        for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                            target_param.data.copy_(base.tau * param.data + (1 - base.tau) * target_param.data)
+                        for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                            target_param.data.copy_(base.tau * param.data + (1 - base.tau) * target_param.data)
+
+                    total_updates += 1
+
+                    if total_updates % max(1, args.policy_broadcast_interval_updates) == 0:
+                        latest = _to_cpu_state_dict(actor)
+                        for wq in weights_queues:
+                            while True:
+                                try:
+                                    wq.get_nowait()
+                                except queue.Empty:
+                                    break
+                            wq.put(latest)
+
+                    if total_env_steps % max(1, base.log_interval) == 0:
+                        elapsed = max(time.time() - start_time, 1e-6)
+                        writer.add_scalar("losses/qf1_loss", qf1_loss.item(), total_env_steps)
+                        writer.add_scalar("losses/qf2_loss", qf2_loss.item(), total_env_steps)
+                        writer.add_scalar("losses/qf_loss", (qf_loss.item() / 2.0), total_env_steps)
+                        writer.add_scalar("losses/critic_grad_norm", float(critic_grad_norm), total_env_steps)
+                        if 'actor_grad_norm' in locals():
+                            writer.add_scalar("losses/actor_grad_norm", float(actor_grad_norm), total_env_steps)
+                        writer.add_scalar("losses/alpha", alpha, total_env_steps)
+                        if base.autotune:
+                            writer.add_scalar("losses/alpha_loss", latest_alpha_loss, total_env_steps)
+                            writer.add_scalar("losses/log_alpha", latest_log_alpha, total_env_steps)
+                            writer.add_scalar("losses/policy_entropy", latest_policy_entropy, total_env_steps)
+                            writer.add_scalar("losses/entropy_gap", latest_entropy_gap, total_env_steps)
+                        writer.add_scalar("charts/SPS", int(total_env_steps / elapsed), total_env_steps)
+                        writer.add_scalar("charts/total_updates", float(total_updates), total_env_steps)
+                        writer.add_scalar("charts/replay_size", float(rb.size), total_env_steps)
+                        writer.add_scalar("perf/learner_queue_wait_sec_total", float(learner_wait_sec_sum), total_env_steps)
+                        writer.add_scalar("perf/learner_update_sec_total", float(learner_update_sec_sum), total_env_steps)
+                        writer.add_scalar("perf/actor_rollout_sec_total", float(actor_rollout_sec_sum), total_env_steps)
+                        writer.add_scalar("perf/actor_put_block_sec_total", float(actor_put_block_sec_sum), total_env_steps)
+                        writer.add_scalar("perf/payload_count", float(payload_count), total_env_steps)
+                        if payload_count > 0:
+                            writer.add_scalar("perf/actor_rollout_sec_per_payload", float(actor_rollout_sec_sum / payload_count), total_env_steps)
+                            writer.add_scalar("perf/actor_put_block_sec_per_payload", float(actor_put_block_sec_sum / payload_count), total_env_steps)
+
+                learner_update_sec_sum += float(time.perf_counter() - update_t0)
+
+            if total_env_steps > 0 and (total_env_steps % max(1, base.checkpoint_every)) == 0:
+                ckpt_path = os.path.join(base.checkpoint_dir, f"{run_name}_step{total_env_steps}.pt")
+                torch.save(
+                    {
+                        "actor": actor.state_dict(),
+                        "qf1": qf1.state_dict(),
+                        "qf2": qf2.state_dict(),
+                        "args": vars(base),
+                        "parallel_args": vars(args),
+                        "global_step": total_env_steps,
+                        "updates": total_updates,
+                    },
+                    ckpt_path,
+                )
+                print(f"[PARALLEL SAC] checkpoint saved: {ckpt_path}", flush=True)
+
+        final_ckpt = os.path.join(base.checkpoint_dir, f"{run_name}_final.pt")
+        torch.save({"actor": actor.state_dict(), "args": vars(base), "parallel_args": vars(args)}, final_ckpt)
+        print(f"[PARALLEL SAC] final actor saved: {final_ckpt}", flush=True)
+    finally:
+        stop_event.set()
+        for p in actor_procs:
+            p.join(timeout=20.0)
+            if p.is_alive():
+                p.terminate()
+        writer.close()
+
+
+if __name__ == "__main__":
+    main()

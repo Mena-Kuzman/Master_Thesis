@@ -1,0 +1,1475 @@
+import argparse
+import sys
+import os
+import time
+import types
+import numpy as np
+import torch
+import pygame
+from typing import Optional
+from collections import deque
+from enum import Enum
+from scipy.spatial.transform import Rotation
+
+from omni.isaac.dynamic_control import _dynamic_control
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, project_root)
+
+# Custom Imports
+from src.base.baseRunner import BaseRunner
+from src.dog.StandingController import StandingController
+
+# Import config to check execution mode
+sys.path.insert(0, os.path.join(project_root, 'pympc'))
+from quadruped_pympc import config as cfg
+
+# Import controller based on execution mode
+if not cfg.simulation_params.get('using_ros', False):
+    # Direct Isaac Sim mode: import MPC controller
+    from quadruped_pympc.isaac_mpc_controller import IsaacMPCController
+else:
+    # ROS mode: import ROS controller
+    try:
+        from src.dog.RosMpcController import RosMpcController
+    except ImportError:
+        print("[DogRunner] Warning: ROS mode selected but RosMpcController not available")
+        from quadruped_pympc.isaac_mpc_controller import IsaacMPCController
+
+class SimulationState(Enum):
+    INIT = 0    # Standing/Damping
+    ACTIVE = 1  # MPC/Torque Control
+
+class DogRunner(BaseRunner):
+    # --- Contact Hysteresis Parameters ---
+    CONTACT_ON_THRESHOLD = 5.0   # Newtons, example value
+    CONTACT_OFF_THRESHOLD = 2.0   # Newtons, example value
+    CONTACT_DEBOUNCE_STEPS = 2    # Number of consecutive steps required
+    dof_offset = 6  # Offset for floating base in dynamics matrices
+
+    def __init__(
+        self,
+        world,
+        *args,
+        pygame_width=320,
+        pygame_height=240,
+        rl_residual_checkpoint: Optional[str] = None,
+        rl_residual_device: str = "cpu",
+        rl_residual_deterministic: bool = True,
+        rl_residual_warmup_steps: int = 120,
+        rl_residual_ramp_steps: int = 400,
+        **kwargs,
+    ):
+        """Initializes the DogRunner, Controllers, and Simulation Interface."""
+        # 1. Init Pygame
+        print("[DogRunner] Initializing Pygame...") #TODO MOVE TO GUI CLASS 
+        pygame.init()
+        self.screen = pygame.display.set_mode((pygame_width, pygame_height))
+        pygame.display.set_caption("DogRunner Control")
+        self.font = pygame.font.Font(None, 30)
+        self.small_font = pygame.font.Font(None, 24)
+
+        # 2. Init Parent (Sim World)
+        super().__init__(world, *args, **kwargs)
+        self.dog = self.stage.dog
+        self.sim_dt = self.stage.world.get_physics_dt()
+
+        # 3. Init Controllers
+        self.standing_controller = StandingController(StandingController.Params())
+        
+        # Initialize MPC controller based on execution mode from config
+        # (we delay actual instantiation until dynamic-control is available
+        # so we can pass a raycast_fn when running inside Isaac)
+        self.using_ros = cfg.simulation_params.get('using_ros', False)
+        self.mpc_controller = None
+        
+        # Reference velocity commands (body frame, like console.py)
+        self.ref_base_lin_vel_H = np.zeros(3)  # [forward, lateral, vertical]
+        self.ref_base_ang_yaw_dot = 0.0        # yaw rotation rate
+        self.pitch_delta = 0.0                  # pitch adjustment
+        self.height_delta = 0.0                 # CoM height adjustment
+        
+        # 4. State Management
+        self.state = SimulationState.INIT
+        self.last_state = self.state
+        self.debug_counter = 0
+        self.physics_step_counter = 0
+        self.last_torques = None
+        self.speed_cmd_hist = deque(maxlen=250)
+        self.speed_act_hist = deque(maxlen=250)
+        self.last_mpc_debug_info = {}
+        self.mpc_diag_print_interval = 25
+        self.rl_residual_checkpoint = rl_residual_checkpoint
+        self.rl_residual_device = rl_residual_device
+        self.rl_residual_deterministic = bool(rl_residual_deterministic)
+        self.rl_residual_warmup_steps = int(max(0, rl_residual_warmup_steps))
+        self.rl_residual_ramp_steps = int(max(0, rl_residual_ramp_steps))
+        self.rl_actor = None
+        self.rl_actor_device = torch.device("cpu")
+        self.rl_policy_enabled = False
+        self.rl_actor_obs_dim = 0
+        self.rl_actor_act_dim = 0
+        self.rl_actor_init_error = None
+        self.rl_residual_speed_blend_start = float(
+            cfg.simulation_params.get('rl_residual_speed_blend_start', 0.35)
+        )
+        self.rl_residual_speed_blend_zero = float(
+            cfg.simulation_params.get('rl_residual_speed_blend_zero', 0.70)
+        )
+        self.rl_residual_disable_on_mpc_failure = bool(
+            cfg.simulation_params.get('rl_residual_disable_on_mpc_failure', True)
+        )
+        self.rl_residual_episode_horizon_steps = int(
+            max(1, cfg.simulation_params.get('rl_residual_episode_horizon_steps', 7000))
+        )
+        self.CONTACT_ON_THRESHOLD = float(cfg.simulation_params.get('isaac_contact_on_threshold', self.CONTACT_ON_THRESHOLD))
+        self.CONTACT_OFF_THRESHOLD = float(cfg.simulation_params.get('isaac_contact_off_threshold', self.CONTACT_OFF_THRESHOLD))
+        self.CONTACT_DEBOUNCE_STEPS = int(max(1, cfg.simulation_params.get('isaac_contact_debounce_steps', self.CONTACT_DEBOUNCE_STEPS)))
+        self.heightmap_visualization_enabled = bool(
+            cfg.simulation_params.get('heightmap_visualization', True)
+        )
+        self.heightmap_visualization_stride = int(
+            max(1, cfg.simulation_params.get('heightmap_visualization_stride', 4))
+        )
+        self._heightmap_draw_interval_s = float(
+            max(0.01, cfg.simulation_params.get('heightmap_visualization_interval_s', 0.05))
+        )
+        self._heightmap_last_draw_time = 0.0
+        self._heightmap_points_root = "/World/Debug/HeightmapPointsByLeg"
+        self._heightmap_legacy_prim_path = "/World/Debug/HeightmapPoints"
+        self._heightmap_legacy_prim_removed = False
+        self._heightmap_prim_ready = False
+
+        # 5. Dynamic Control Interface (Isaac Sim)
+        self._dc = _dynamic_control.acquire_dynamic_control_interface()
+        self.art_handle = self._dc.get_articulation(self.dog.articulation_root)
+
+        # Instantiate the MPC controller now that `_dc` is available so we can
+        # provide a dynamic raycast function to the HeightMap adapter.
+        try:
+            if self.using_ros:
+                print("[DogRunner] Using ROS-based MPC controller")
+                try:
+                    self.mpc_controller = RosMpcController(RosMpcController.Params())
+                except Exception:
+                    print("[DogRunner] Warning: RosMpcController not available, falling back to IsaacMPCController")
+                    self.mpc_controller = IsaacMPCController(raycast_fn=self._make_raycast_fn())
+            else:
+                print("[DogRunner] Using direct Isaac Sim MPC controller")
+                self.mpc_controller = IsaacMPCController(raycast_fn=self._make_raycast_fn())
+        except Exception as e:
+            print(f"[DogRunner] Failed to create MPC controller: {e}")
+            self.mpc_controller = IsaacMPCController(raycast_fn=self._make_raycast_fn())
+
+        # Optional: load a trained SAC actor to provide step-height residuals
+        # while keeping MPC as the primary locomotion controller.
+        self._try_init_rl_residual_policy()
+    
+
+        # --- Contact Hysteresis State ---
+        self.contact_state = [False] * 4
+        self.contact_debounce = [0] * 4
+        self.gait_phase = ['stance'] * 4  # Placeholder, should be set by your gait logic
+        # 6. Setup Mappings and Properties
+        self.stage.world.step(render=False) # Step once to ensure handles exist
+        # Contact sensors must be initialized after the final reset/first step.
+        # BaseRunner resets the world in its __init__, so initializing earlier will yield zero readings.
+        if hasattr(self.dog, "initialize_sensors"):
+            self.dog.initialize_sensors()
+        
+        self.joints_mapping()       #todo MOVE BOTH TO THE DOG CLASS 
+        self._setup_dof_properties()
+        
+        # 7. Pre-allocate buffers
+        self.last_feet_jac = np.zeros((4, 3, self.num_ctrl_joints + self.dof_offset))
+        self.feet_jac_dot_ctrl = np.zeros_like(self.last_feet_jac)
+        try:
+            root_pos, root_quat = self.dog.articulation.get_world_poses()
+            self._initial_root_pos = np.asarray(root_pos[0], dtype=np.float64).copy()
+            self._initial_root_quat = np.asarray(root_quat[0], dtype=np.float64).copy()
+        except Exception:
+            self._initial_root_pos = np.array([0.0, 0.0, 0.35], dtype=np.float64)
+            self._initial_root_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        
+        # 8. Initialize Jacobian diagnostic counters (actual JacobianDiagnostic class
+        #    will be imported lazily when diagnostics are first run)
+        self.jacobian_diagnostic = None
+        self.run_jacobian_diagnostics = False  # Toggle with 'j' key
+        self.diagnostic_counter = 0
+        self.diagnostic_interval = 200  # Run diagnostics every N steps
+
+        # Auto-start ACTIVE state after N physics steps when running headless.
+        # When a display is not available (headless Isaac Sim) there is no
+        # keyboard to press '2', so we auto-transition.
+        self.auto_active_step = 50  # None to disable; set >0 to auto-start
+        
+        print("[DogRunner] Initialization Complete.")
+
+    def _try_init_rl_residual_policy(self):
+        ckpt_path = self.rl_residual_checkpoint
+        if not ckpt_path:
+            self.rl_actor_init_error = "No RL checkpoint path configured."
+            return
+
+        if self.using_ros:
+            print("[DogRunner RL] RL residual policy is only supported in direct Isaac MPC mode.")
+            self.rl_actor_init_error = "RL residual is disabled in ROS mode."
+            return
+
+        ckpt_raw = os.path.expanduser(str(ckpt_path))
+        if os.path.isabs(ckpt_raw):
+            ckpt_path = os.path.abspath(ckpt_raw)
+        else:
+            # Prefer workspace-root relative paths (../checkpoints from IsaacLabFromTemu),
+            # then keep legacy current-working-directory behavior as fallback.
+            candidate_repo = os.path.abspath(os.path.join(project_root, "..", ckpt_raw))
+            candidate_project = os.path.abspath(os.path.join(project_root, ckpt_raw))
+            candidate_cwd = os.path.abspath(ckpt_raw)
+            if os.path.exists(candidate_repo):
+                ckpt_path = candidate_repo
+            elif os.path.exists(candidate_project):
+                ckpt_path = candidate_project
+            else:
+                ckpt_path = candidate_cwd
+        # Diagnostic info: print resolved path and file stats
+        try:
+            exists = os.path.exists(ckpt_path)
+            size = os.path.getsize(ckpt_path) if exists else -1
+            msg = f"[DogRunner RL] Attempting to load checkpoint: {ckpt_path} (exists={exists}, size={size})"
+            print(msg)
+            try:
+                with open('/tmp/dog_runner_rl_diag.log', 'a') as f:
+                    f.write(msg + "\n")
+            except Exception:
+                pass
+        except Exception:
+            print(f"[DogRunner RL] Attempting to load checkpoint: {ckpt_path}")
+
+        if not os.path.exists(ckpt_path):
+            print(f"[DogRunner RL] Checkpoint not found: {ckpt_path}")
+            self.rl_actor_init_error = f"Checkpoint not found: {ckpt_path}"
+            return
+
+        try:
+            # helper to write tiny diagnostics both to stdout and the diag file
+            def _write_diag(m: str):
+                try:
+                    print(m)
+                except Exception:
+                    pass
+                try:
+                    with open('/tmp/dog_runner_rl_diag.log', 'a') as _f:
+                        _f.write(m + "\n")
+                except Exception:
+                    pass
+
+            _write_diag("[DogRunner RL] import Actor start")
+            try:
+                from sac_actor import Actor
+                _write_diag("[DogRunner RL] import Actor ok (standalone sac_actor module)")
+            except Exception as _import_e:
+                import traceback
+                _write_diag(f"[DogRunner RL] import Actor exception: {_import_e}")
+                try:
+                    _write_diag(traceback.format_exc())
+                except Exception:
+                    pass
+                raise
+
+            preferred = str(self.rl_residual_device).lower().strip()
+            if preferred == "cuda" and torch.cuda.is_available():
+                target_device = torch.device("cuda")
+            else:
+                target_device = torch.device("cpu")
+
+            def _with_unpickle_stubs(load_fn):
+                """Temporarily inject lightweight modules/classes needed by legacy checkpoints.
+
+                Some old checkpoints pickle dataclass instances from training scripts
+                (for example train_sac_step_height_residual.Args). Importing that
+                script inside Isaac can pull TensorBoard/TensorFlow and crash with
+                duplicate grpc flag registration. This shim satisfies unpickling
+                without importing the heavy training modules.
+                """
+                inserted = {}
+                try:
+                    module_name = "train_sac_step_height_residual"
+                    if module_name not in sys.modules:
+                        stub = types.ModuleType(module_name)
+
+                        class Args:  # noqa: N801 - class name must match pickled symbol
+                            pass
+
+                        stub.Args = Args
+                        sys.modules[module_name] = stub
+                        inserted[module_name] = None
+                    return load_fn()
+                finally:
+                    for name, old_value in inserted.items():
+                        if old_value is None:
+                            sys.modules.pop(name, None)
+                        else:
+                            sys.modules[name] = old_value
+
+            _write_diag(f"[DogRunner RL] torch.load start (map_location=cpu) -> {ckpt_path}")
+            checkpoint = None
+            try:
+                # Prefer safe tensor-only deserialization path when possible.
+                checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                _write_diag("[DogRunner RL] torch.load ok (weights_only=True)")
+            except TypeError:
+                # Older torch versions do not support weights_only.
+                checkpoint = torch.load(ckpt_path, map_location="cpu")
+                _write_diag("[DogRunner RL] torch.load ok (legacy torch path)")
+            except Exception as e:
+                _write_diag(
+                    f"[DogRunner RL] weights_only load failed ({type(e).__name__}: {e}). "
+                    "Retrying with compatibility unpickle stubs."
+                )
+                try:
+                    checkpoint = _with_unpickle_stubs(
+                        lambda: torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                    )
+                except TypeError:
+                    checkpoint = _with_unpickle_stubs(
+                        lambda: torch.load(ckpt_path, map_location="cpu")
+                    )
+            _write_diag(f"[DogRunner RL] torch.load ok, type={type(checkpoint)}")
+
+            # Diagnostic: show checkpoint keys/types (print + file)
+            try:
+                ck_keys = list(checkpoint.keys()) if isinstance(checkpoint, dict) else []
+                _write_diag(f"[DogRunner RL] checkpoint keys: {ck_keys}")
+            except Exception:
+                _write_diag("[DogRunner RL] checkpoint keys: <error enumerating keys>")
+
+            actor_state = checkpoint.get('actor', None) if isinstance(checkpoint, dict) else None
+            if actor_state is None:
+                _write_diag(f"[DogRunner RL] Invalid checkpoint (missing 'actor'): {ckpt_path}")
+                self.rl_actor_init_error = f"Invalid checkpoint (missing 'actor'): {ckpt_path}"
+                return
+
+            obs_dim = 56
+            hidden_dim1 = 64
+            hidden_dim2 = 64
+            act_dim = 1
+            try:
+                if isinstance(actor_state, dict) and 'fc1.weight' in actor_state:
+                    obs_dim = int(actor_state['fc1.weight'].shape[1])
+                    hidden_dim1 = int(actor_state['fc1.weight'].shape[0])
+                if isinstance(actor_state, dict) and 'fc2.weight' in actor_state:
+                    hidden_dim2 = int(actor_state['fc2.weight'].shape[0])
+                if isinstance(actor_state, dict) and 'fc_mean.weight' in actor_state:
+                    act_dim = int(actor_state['fc_mean.weight'].shape[0])
+            except Exception:
+                obs_dim = 56
+                hidden_dim1 = 64
+                hidden_dim2 = 64
+            action_low = np.full((act_dim,), -1.0, dtype=np.float32)
+            action_high = np.full((act_dim,), 1.0, dtype=np.float32)
+
+            _write_diag("[DogRunner RL] Actor construction start")
+            actor = Actor(
+                obs_dim,
+                action_low,
+                action_high,
+                hidden_dim1=hidden_dim1,
+                hidden_dim2=hidden_dim2,
+            )
+            _write_diag("[DogRunner RL] Actor construction ok")
+
+            _write_diag("[DogRunner RL] load_state_dict start")
+            actor.load_state_dict(actor_state)
+            _write_diag("[DogRunner RL] load_state_dict ok")
+
+            _write_diag(f"[DogRunner RL] actor.to start -> {target_device}")
+            actor.to(target_device)
+            _write_diag("[DogRunner RL] actor.to ok")
+
+            _write_diag("[DogRunner RL] actor.eval start")
+            actor.eval()
+            _write_diag("[DogRunner RL] actor.eval ok")
+
+            # Count parameters for quick sanity check
+            try:
+                param_count = sum(p.numel() for p in actor.parameters())
+            except Exception:
+                param_count = -1
+            _write_diag(f"[DogRunner RL] Actor instantiated: device={target_device}, params={param_count}")
+
+            # Set the resolved device for future inference
+            self.rl_actor_device = target_device
+            self.rl_actor_obs_dim = int(obs_dim)
+            self.rl_actor_act_dim = int(act_dim)
+
+            self.rl_actor = actor
+            self.rl_policy_enabled = True
+            self.rl_actor_init_error = None
+            try:
+                self.mpc_controller.enable_rl_step_height(True)
+                self.mpc_controller.set_step_height_residual(0.0)
+            except Exception:
+                _write_diag("[DogRunner RL] Warning: failed to enable or init RL step height on MPC controller")
+
+            _write_diag(
+                f"[DogRunner RL] Loaded residual actor from {ckpt_path} (device={self.rl_actor_device}, deterministic={self.rl_residual_deterministic})"
+            )
+            _write_diag(f"[DogRunner RL] Actor hidden dims: fc1={hidden_dim1}, fc2={hidden_dim2}")
+            _write_diag(f"[DogRunner RL] Actor expects observation dim: {self.rl_actor_obs_dim}")
+            _write_diag(f"[DogRunner RL] Actor expects action dim: {self.rl_actor_act_dim}")
+        except Exception as e:
+            import traceback
+            self.rl_actor = None
+            self.rl_policy_enabled = False
+            self.rl_actor_obs_dim = 0
+            self.rl_actor_act_dim = 0
+            self.rl_actor_init_error = str(e)
+            _write_diag(f"[DogRunner RL] Failed to load residual actor: {e}")
+            try:
+                with open('/tmp/dog_runner_rl_diag.log', 'a') as _f:
+                    _f.write(traceback.format_exc() + "\n")
+            except Exception:
+                try:
+                    traceback.print_exc()
+                except Exception:
+                    pass
+
+    def _apply_rl_residual_policy(self):
+        if not self.rl_policy_enabled or self.rl_actor is None:
+            return
+
+        try:
+            if self.physics_step_counter < self.rl_residual_warmup_steps:
+                gate_warmup = 0.0
+            elif self.rl_residual_ramp_steps > 0:
+                gate_warmup = np.clip(
+                    (self.physics_step_counter - self.rl_residual_warmup_steps) / float(self.rl_residual_ramp_steps),
+                    0.0,
+                    1.0,
+                )
+            else:
+                gate_warmup = 1.0
+
+            cmd_speed = float(np.linalg.norm(np.asarray(self.ref_base_lin_vel_H[:2], dtype=np.float32)))
+            v0 = float(self.rl_residual_speed_blend_start)
+            v1 = float(max(v0 + 1e-6, self.rl_residual_speed_blend_zero))
+            if cmd_speed <= v0:
+                gate_speed = 1.0
+            elif cmd_speed >= v1:
+                gate_speed = 0.0
+            else:
+                gate_speed = float((v1 - cmd_speed) / (v1 - v0))
+
+            gate_mpc = 1.0
+            mpc_status = None
+            mpc_diag = self.last_mpc_debug_info.get('mpc_diag', {}) if isinstance(self.last_mpc_debug_info, dict) else {}
+            if isinstance(mpc_diag, dict):
+                try:
+                    mpc_status = int(mpc_diag.get('solve_status', -999))
+                except Exception:
+                    mpc_status = None
+            if self.rl_residual_disable_on_mpc_failure and mpc_status in (3, 4):
+                gate_mpc = 0.0
+
+            gate = float(gate_warmup * gate_speed * gate_mpc)
+            self._sync_rl_observation_context(gate)
+
+            obs = self.mpc_controller.get_rl_observation_vector()
+            expected_dim = int(self.rl_actor_obs_dim) if self.rl_actor_obs_dim > 0 else int(obs.shape[0])
+            if obs.shape[0] != expected_dim:
+                # Adapt observation size to checkpoint architecture.
+                if obs.shape[0] > expected_dim:
+                    obs = obs[:expected_dim]
+                else:
+                    obs_padded = np.zeros(expected_dim, dtype=np.float32)
+                    obs_padded[:obs.shape[0]] = obs
+                    obs = obs_padded
+
+            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.rl_actor_device).unsqueeze(0)
+
+            with torch.no_grad():
+                if self.rl_residual_deterministic:
+                    _, _, mean_action = self.rl_actor.get_action(obs_t)
+                    action = mean_action.squeeze(0).detach().cpu().numpy()
+                else:
+                    sampled_action, _, _ = self.rl_actor.get_action(obs_t)
+                    action = sampled_action.squeeze(0).detach().cpu().numpy()
+
+            action = np.asarray(action, dtype=np.float32).reshape(-1)
+            if action.size == 0:
+                action = np.zeros((1,), dtype=np.float32)
+            action = np.clip(action, -1.0, 1.0)
+
+            max_residual = float(getattr(self.mpc_controller, '_rl_residual_max_abs_m', 0.0))
+            residual_action = float(action[0])
+            swing_action = float(action[1]) if action.size > 1 else 0.0
+            residual_m = residual_action * max_residual * float(gate)
+            self.mpc_controller.set_step_height_residual(residual_m)
+
+            swing_time_min = float(getattr(self.mpc_controller.wb_interface, 'adaptive_swing_time_min', cfg.simulation_params.get('adaptive_swing_time_min', 0.16)))
+            swing_time_max = float(getattr(self.mpc_controller.wb_interface, 'adaptive_swing_time_max', cfg.simulation_params.get('adaptive_swing_time_max', 0.22)))
+            nominal_swing_time = float(getattr(self.mpc_controller.wb_interface, 'adaptive_swing_time', cfg.simulation_params.get('adaptive_swing_time', 0.20)))
+            target_swing_time = float(swing_time_min + 0.5 * (swing_action + 1.0) * (swing_time_max - swing_time_min))
+            applied_swing_time = float(nominal_swing_time + float(gate) * (target_swing_time - nominal_swing_time))
+            try:
+                self.mpc_controller.set_adaptive_swing_time(applied_swing_time)
+            except Exception:
+                pass
+
+            nominal_h = float(getattr(self.mpc_controller, '_nominal_step_height', 0.0))
+            applied_residual = float(getattr(self.mpc_controller, '_rl_step_height_residual_m', residual_m))
+            min_h = float(getattr(self.mpc_controller, '_rl_step_height_min_m', nominal_h))
+            max_h = float(getattr(self.mpc_controller, '_rl_step_height_max_m', nominal_h))
+            effective_h = float(np.clip(nominal_h + applied_residual, min_h, max_h))
+
+            if int(self.physics_step_counter) % 100 == 0:
+                print(
+                    "[DogRunner RL] step={} action_r={:.3f} action_s={:.3f} gate={:.2f} (warm={:.2f}, speed={:.2f}, mpc={:.2f}) cmd_v={:.3f} status={} residual_target={:.4f}m residual_applied={:.4f}m swing_time_target={:.4f}s swing_time_applied={:.4f}s step_height_eff={:.4f}m".format(
+                        int(self.physics_step_counter),
+                        residual_action,
+                        swing_action,
+                        float(gate),
+                        float(gate_warmup),
+                        float(gate_speed),
+                        float(gate_mpc),
+                        float(cmd_speed),
+                        int(mpc_status) if mpc_status is not None else -999,
+                        float(residual_m),
+                        applied_residual,
+                        target_swing_time,
+                        applied_swing_time,
+                        effective_h,
+                    )
+                )
+        except Exception as e:
+            print(f"[DogRunner RL] Residual inference error: {e}")
+
+    def _sync_rl_observation_context(self, residual_gate: float) -> None:
+        """Populate MPC-controller RL observation context for runtime inference."""
+        episode_phase = float(
+            np.clip(
+                float(self.physics_step_counter) / float(max(1, self.rl_residual_episode_horizon_steps)),
+                0.0,
+                1.0,
+            )
+        )
+
+        base_x = None
+        snap = self.mpc_controller.get_rl_state_snapshot()
+        if isinstance(snap, dict):
+            pos = np.asarray(snap.get('position', np.zeros(3)), dtype=np.float64)
+            if pos.size >= 1:
+                base_x = float(pos[0])
+
+        course_end_x = None
+        params = getattr(self.stage, 'params', None)
+        if params is not None and bool(getattr(params, 'add_stairs', False)):
+            try:
+                stair_start_x = float(getattr(params, 'stair_start_x'))
+                stair_step_width = float(getattr(params, 'stair_step_width'))
+                stair_num_steps_up = int(getattr(params, 'stair_num_steps_up'))
+                stair_num_steps_down = int(getattr(params, 'stair_num_steps_down'))
+                course_end_x = stair_start_x + stair_step_width * (stair_num_steps_up + stair_num_steps_down)
+            except Exception:
+                course_end_x = None
+
+        if base_x is not None and course_end_x is not None:
+            distance_to_course_end = float(np.clip(course_end_x - base_x, -5.0, 10.0) / 10.0)
+        else:
+            distance_to_course_end = 0.0
+
+        try:
+            self.mpc_controller.set_rl_observation_context(
+                residual_gate=float(np.clip(residual_gate, 0.0, 1.0)),
+                episode_phase=episode_phase,
+                distance_to_course_end=distance_to_course_end,
+            )
+        except Exception:
+            pass
+
+    def hard_reset_robot_state(self, settle_steps: int = 20):
+        """Hard-reset robot base/joints/velocities to a known quiet state at episode boundaries."""
+        try:
+            self.state = SimulationState.INIT
+            self.state_machine()
+        except Exception:
+            pass
+
+        try:
+            self._set_dof_properties(self.initial_dof_props)
+        except Exception:
+            pass
+
+        try:
+            target_pos_ctrl = self.standing_controller.params.target_joint_seat
+            target_pos_sim = np.zeros(self.num_sim_dofs)
+            target_pos_sim[self.valid_sim_indices] = target_pos_ctrl[self.valid_ctrl_mask]
+            self.dog.articulation.set_joint_positions(target_pos_sim)
+            try:
+                self.dog.articulation.set_joint_velocities(np.zeros((1, self.num_sim_dofs), dtype=np.float32))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        try:
+            self.dog.articulation.set_world_poses(
+                positions=np.asarray([self._initial_root_pos], dtype=np.float32),
+                orientations=np.asarray([self._initial_root_quat], dtype=np.float32),
+            )
+        except Exception:
+            pass
+
+        try:
+            self.dog.articulation.set_linear_velocities(np.zeros((1, 3), dtype=np.float32))
+            self.dog.articulation.set_angular_velocities(np.zeros((1, 3), dtype=np.float32))
+        except Exception:
+            pass
+
+        try:
+            zero_tau = np.zeros((1, self.num_sim_dofs), dtype=np.float32)
+            self.dog.articulation.set_joint_efforts(torch.tensor(zero_tau, dtype=torch.float32, device="cpu"))
+        except Exception:
+            pass
+
+        self.last_torques = None
+        self.torques_sim = np.zeros(self.num_sim_dofs)
+        self.physics_step_counter = 0
+        self.debug_counter = 0
+        self.speed_cmd_hist.clear()
+        self.speed_act_hist.clear()
+
+        self.ref_base_lin_vel_H[:] = 0.0
+        self.ref_base_ang_yaw_dot = 0.0
+        self.pitch_delta = 0.0
+
+        for _ in range(int(max(0, settle_steps))):
+            try:
+                self.stage.world.step(render=False)
+            except Exception:
+                break
+
+    def joints_mapping(self):
+        """Maps simulation DOF indices to Controller joint indices."""
+        self.sim_joint_names = list(self.dog.articulation.dof_names)
+        self.controller_joint_names = self.standing_controller.params.controller_joint_names
+        self.num_sim_dofs = len(self.sim_joint_names)
+        self.num_ctrl_joints = len(self.controller_joint_names)
+
+        if not self.sim_joint_names:
+            print("[DogRunner] ERROR: No Sim DOFs found.")
+            return
+
+        # Create Index Map
+        sim_map = {name: idx for idx, name in enumerate(self.sim_joint_names)}
+        ctrl_to_sim_indices = []
+        
+        for name in self.controller_joint_names:
+            if name in sim_map:
+                ctrl_to_sim_indices.append(sim_map[name])
+            else:
+                print(f"[DogRunner] Warning: Controller joint '{name}' not in Sim.")
+                ctrl_to_sim_indices.append(-1)
+        
+        self.ctrl_to_sim_idx_np = np.array(ctrl_to_sim_indices, dtype=int)
+        self.valid_ctrl_mask = self.ctrl_to_sim_idx_np >= 0
+        self.valid_sim_indices = self.ctrl_to_sim_idx_np[self.valid_ctrl_mask]
+
+        # Map Body Indices (Feet/Hips)
+        self.leg_order = ['FL', 'FR', 'RL', 'RR']
+        self.body_indices = {}
+        self.body_names_of_interest = []
+        self.body_names_list = list(self.dog.articulation.body_names)
+        
+        for leg in self.leg_order:
+            foot_name = f'{leg}_foot'
+            hip_name = f'{leg}_hip'
+            if foot_name in self.body_names_list:
+                self.body_indices[foot_name] = self.body_names_list.index(foot_name)
+                self.body_names_of_interest.append(foot_name)
+            if hip_name in self.body_names_list:
+                self.body_indices[hip_name] = self.body_names_list.index(hip_name)
+                self.body_names_of_interest.append(hip_name)
+
+    def _setup_dof_properties(self):
+        """Stores initial damping/stiffness and creates active (torque) properties."""
+        self.initial_dof_props = self._dc.get_articulation_dof_properties(self.art_handle)
+        
+        if self.initial_dof_props is None:
+            print("[DogRunner] ERROR: Failed to get DOF properties.")
+            return
+
+        # Create Active Properties
+        self.active_dof_props = self.initial_dof_props.copy()
+        self.active_dof_props["stiffness"] = 0.0
+        self.active_dof_props["damping"] = 0.0
+
+        # Set initial pose for standing
+        target_pos_ctrl = self.standing_controller.params.target_joint_seat
+        target_pos_sim = np.zeros(self.num_sim_dofs)
+        target_pos_sim[self.valid_sim_indices] = target_pos_ctrl[self.valid_ctrl_mask]
+        self.dog.articulation.set_joint_positions(target_pos_sim)
+
+    def _make_raycast_fn(self):
+        """Attempt to auto-detect a raycast function from the Isaac dynamic control interface.
+
+        Returns a callable `raycast_fn(origin, direction, max_dist)` or None when not found.
+        The returned callable should return [x,y,z] on hit or None when no hit.
+        """
+        # First try the explicit omni.physx scene query interface (preferred in Isaac)
+        try:
+            from omni.physx import get_physx_scene_query_interface
+            sqi = get_physx_scene_query_interface()
+
+            def _omni_raycast(origin, direction, max_dist=1.0):
+                # exclusion radius to ignore self-hits (meters)
+                exclusion_radius = float(cfg.simulation_params.get('heightmap_self_hit_exclusion_radius', 0.12))
+                self_hit_z_tolerance = float(cfg.simulation_params.get('heightmap_self_hit_z_tolerance', 0.015))
+
+                def _is_self_hit(hit_point):
+                    try:
+                        last_body_poses = getattr(self, '_last_body_poses', None)
+                        if not last_body_poses:
+                            return False
+                        r2 = exclusion_radius * exclusion_radius
+                        hx, hy, hz = float(hit_point[0]), float(hit_point[1]), float(hit_point[2])
+                        for bp in last_body_poses.values():
+                            dx = hx - float(bp[0])
+                            dy = hy - float(bp[1])
+                            dz_abs = abs(hz - float(bp[2]))
+                            if (dx * dx + dy * dy) <= r2 and dz_abs <= self_hit_z_tolerance:
+                                return True
+                    except Exception:
+                        return False
+                    return False
+
+                # Prefer the `raycast_closest` method which returns a dict with 'hit' and 'position'
+                for fn_name in ('raycast_closest', 'raycastClosest', 'raycast_closest_hit', 'raycast'):
+                    fn = getattr(sqi, fn_name, None)
+                    if not callable(fn):
+                        continue
+                    try:
+                        # try common calling convention
+                        res = fn(origin, direction, float(max_dist))
+                    except TypeError:
+                        try:
+                            res = fn(float(origin[0]), float(origin[1]), float(origin[2]),
+                                     float(direction[0]), float(direction[1]), float(direction[2]), float(max_dist))
+                        except Exception:
+                            res = None
+                    except Exception:
+                        res = None
+
+                    if res is None:
+                        continue
+
+                    # Normalize common dictionary/object returns
+                    if isinstance(res, dict):
+                        if res.get('hit', False) and 'position' in res:
+                            pos = res['position']
+                            hit = [float(pos[0]), float(pos[1]), float(pos[2])]
+                            if _is_self_hit(hit):
+                                return None
+                            return hit
+                        if 'position' in res:
+                            pos = res['position']
+                            hit = [float(pos[0]), float(pos[1]), float(pos[2])]
+                            if _is_self_hit(hit):
+                                return None
+                            return hit
+                        # Some versions return (hit, position) tuple
+                        if len(res) >= 2 and isinstance(res[1], (list, tuple)) and len(res[1]) >= 3:
+                            p = res[1]
+                            hit = [float(p[0]), float(p[1]), float(p[2])]
+                            if _is_self_hit(hit):
+                                return None
+                            return hit
+
+                    if hasattr(res, 'position'):
+                        p = res.position
+                        return [float(p[0]), float(p[1]), float(p[2])]
+
+                    if isinstance(res, (list, tuple)) and len(res) >= 3 and all(isinstance(v, (int, float)) for v in res[:3]):
+                        return [float(res[0]), float(res[1]), float(res[2])]
+
+                return None
+
+            # quick test call
+            try:
+                _omni_raycast([0.0, 0.0, 0.5], [0.0, 0.0, -1.0], 1.0)
+                try:
+                    print("[DogRunner] Raycast provider: omni.physx.get_physx_scene_query_interface")
+                except Exception:
+                    pass
+                return _omni_raycast
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # No fallback: only omni.physx scene-query is supported in this simplified runner
+        return None
+
+    def _draw_heightmap_visualization(self):
+        """Draw per-leg heightmap points as a USD Points prim in the Isaac viewport."""
+        if not self.heightmap_visualization_enabled:
+            return
+        if self.physics_step_counter % self.heightmap_visualization_stride != 0:
+            return
+
+        now = time.time()
+        if (now - self._heightmap_last_draw_time) < self._heightmap_draw_interval_s:
+            return
+        self._heightmap_last_draw_time = now
+
+        heightmaps = getattr(self.mpc_controller, 'heightmaps', None)
+        if not isinstance(heightmaps, dict) or not heightmaps:
+            return
+
+        points_by_leg = {}
+        leg_colors = {
+            'FL': (0.95, 0.20, 0.20),
+            'FR': (0.20, 0.95, 0.20),
+            'RL': (0.20, 0.40, 0.95),
+            'RR': (0.95, 0.85, 0.20),
+        }
+
+        for leg_name, hm in heightmaps.items():
+            data = getattr(hm, 'data', None)
+            if data is None:
+                continue
+
+            arr = np.asarray(data, dtype=np.float64)
+            if arr.ndim != 4 or arr.shape[-1] < 3:
+                continue
+
+            pts = arr[:, :, 0, :3].reshape(-1, 3)
+            valid = np.isfinite(pts).all(axis=1)
+            pts = pts[valid]
+            if pts.size == 0:
+                continue
+
+            points_by_leg[str(leg_name)] = [
+                (float(p[0]), float(p[1]), float(p[2]) + 0.01) for p in pts
+            ]
+
+        if not points_by_leg:
+            if self.physics_step_counter % 500 == 0:
+                print("[Heightmap Viz] No valid heightmap points available yet")
+            return
+
+        try:
+            from pxr import UsdGeom, Gf, Vt
+
+            stage = getattr(self.stage, 'stage', None)
+            if stage is None:
+                return
+
+            # Ensure /World/Debug exists before defining the points prim.
+            debug_scope_path = "/World/Debug"
+            if not stage.GetPrimAtPath(debug_scope_path).IsValid():
+                UsdGeom.Scope.Define(stage, debug_scope_path)
+
+            if not self._heightmap_legacy_prim_removed:
+                # Remove stale aggregate prim to avoid legacy primvar metadata conflicts.
+                if stage.GetPrimAtPath(self._heightmap_legacy_prim_path).IsValid():
+                    stage.RemovePrim(self._heightmap_legacy_prim_path)
+                self._heightmap_legacy_prim_removed = True
+
+            if not stage.GetPrimAtPath(self._heightmap_points_root).IsValid():
+                UsdGeom.Scope.Define(stage, self._heightmap_points_root)
+
+            total_points = 0
+            for leg_name, points in points_by_leg.items():
+                points_path = f"{self._heightmap_points_root}/{leg_name}"
+                points_geom = UsdGeom.Points.Define(stage, points_path)
+                points_attr = points_geom.GetPointsAttr()
+                widths_attr = points_geom.GetWidthsAttr()
+
+                points_vt = Vt.Vec3fArray([Gf.Vec3f(*p) for p in points])
+                points_attr.Set(points_vt)
+
+                # Use constant width to avoid per-point width/point count races in Hydra.
+                points_geom.SetWidthsInterpolation(UsdGeom.Tokens.constant)
+                widths_attr.Set(Vt.FloatArray([0.02]))
+
+                gprim = UsdGeom.Gprim(points_geom.GetPrim())
+                color_pv = gprim.CreateDisplayColorPrimvar(UsdGeom.Tokens.constant)
+                color = leg_colors.get(leg_name, (0.85, 0.85, 0.85))
+                color_pv.Set(Vt.Vec3fArray([Gf.Vec3f(*color)]))
+                total_points += len(points)
+
+            if not self._heightmap_prim_ready and self.physics_step_counter % 200 == 0:
+                print(f"[Heightmap Viz] USD points active ({total_points} points)")
+                self._heightmap_prim_ready = True
+        except Exception as e:
+            if self.physics_step_counter % 500 == 0:
+                print(f"[Heightmap Viz] USD draw failed: {e}")
+
+    def _set_dof_properties(self, props):
+        if self.art_handle != _dynamic_control.INVALID_HANDLE and props is not None:
+            self._dc.set_articulation_dof_properties(self.art_handle, props)
+
+    def pre_physics(self):
+        """Main simulation loop step."""
+
+        self._handle_ui()
+        self.state_machine()
+        
+        # 'states' contains: sim_root_state_w, current_pos_ctrl, current_vel_ctrl, sim_contact_list
+        states = self.get_states() 
+        # 'dynamics' contains: mass_ctrl, bias_ctrl, base_inertia_3x3, feet_jac, etc.
+        dynamics = self._compute_dynamics(states)
+
+        # Extract state information for MPC
+        sim_root_state_w = states['sim_root_state_w']
+        quat_wxyz = sim_root_state_w[3:7]
+        quat_xyzw = np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]])  # Convert wxyz to xyzw
+        
+        # Print current linear velocity periodically
+        if self.physics_step_counter % 100 == 0:
+            linear_vel = sim_root_state_w[7:10]
+            act_vx = float(linear_vel[0])
+            cmd_vx = float(self.ref_base_lin_vel_H[0])
+            cmd_speed_nominal = float(np.linalg.norm(self.ref_base_lin_vel_H[0:2]))
+            act_speed_nominal = float(np.linalg.norm(linear_vel[0:2]))
+            mpc_ref_vx_eff = cmd_vx
+            mpc_ref_speed_eff = cmd_speed_nominal
+            try:
+                snap = self.mpc_controller.get_rl_state_snapshot()
+                if isinstance(snap, dict):
+                    ref_lin = np.asarray(snap.get('ref_base_lin_vel', np.zeros(3)), dtype=np.float64)
+                    ref_lin_eff = np.asarray(snap.get('ref_base_lin_vel_effective', ref_lin), dtype=np.float64)
+                    mpc_ref_vx_eff = float(ref_lin[0])
+                    mpc_ref_speed_eff = float(np.linalg.norm(ref_lin_eff[0:2]))
+            except Exception:
+                pass
+
+            self.speed_cmd_hist.append(cmd_speed_nominal)
+            self.speed_act_hist.append(act_speed_nominal)
+            cmd_avg = float(np.mean(self.speed_cmd_hist)) if len(self.speed_cmd_hist) > 0 else 0.0
+            act_avg = float(np.mean(self.speed_act_hist)) if len(self.speed_act_hist) > 0 else 0.0
+            inst_err = act_speed_nominal - cmd_speed_nominal
+            avg_err = act_avg - cmd_avg
+            print(
+                f"[DogRunner] CMD_speed_nom: {cmd_speed_nominal:.3f} m/s | ACT_speed_nom: {act_speed_nominal:.3f} m/s "
+                f"| MPC_REF_speed_eff: {mpc_ref_speed_eff:.3f} m/s | ERR_speed(inst/avg): {inst_err:+.3f}/{avg_err:+.3f} "
+                f"| CMD_vx: {cmd_vx:.3f} | ACT_vx: {act_vx:.3f} | MPC_REF_vx_nom: {mpc_ref_vx_eff:.3f}"
+            )
+        
+        # Store yaw for velocity command frame conversion
+        from scipy.spatial.transform import Rotation as _Rot
+        self._last_yaw = _Rot.from_quat(quat_xyzw).as_euler('xyz')[2]
+        
+        state_data = {
+            'timestamp': float(self.physics_step_counter * self.sim_dt),
+            'root_state_w': states['sim_root_state_w'],
+            'contact_list': states['sim_contact_list'],
+            'joint_pos_ctrl': states['current_pos_ctrl'],
+            'joint_vel_ctrl': states['current_vel_ctrl'],
+            'feet_pos_w': dynamics['feet_pos_w'],
+            'feet_vel_w': dynamics['feet_vel_w'],
+            'hip_pos_w': dynamics['hip_pos_w'],
+            'mass_ctrl': dynamics['mass_ctrl'],
+            'base_inertia_3x3': dynamics['base_inertia_3x3'],
+            'bias_ctrl': dynamics['bias_ctrl'],
+            'feet_jac': dynamics['feet_jac'],
+            'feet_jac_dot': dynamics['feet_jac_dot'],
+        }
+        
+        torques_ctrl = self._get_controller_torques(state_data, quat_xyzw, dynamics)
+        self._draw_heightmap_visualization()
+        self._map_torques_to_sim(torques_ctrl)
+        
+        # Run Jacobian diagnostics if enabled
+        if self.run_jacobian_diagnostics and self.state == SimulationState.ACTIVE:
+            self._run_jacobian_diagnostic(state_data, dynamics)
+
+        self.debug_counter += 1
+
+    def step_physics(self):
+        """Apply final efforts to simulation."""
+        if self.physics_step_counter % 1 == 0:
+            if hasattr(self, 'torques_sim'): 
+                torques_tensor = torch.tensor(self.torques_sim, dtype=torch.float32, device="cpu").unsqueeze(0)
+                self.dog.articulation.set_joint_efforts(torques_tensor)
+
+        self.physics_step_counter += 1
+
+    def _handle_ui(self):
+        """Pygame Rendering and Event Handling (matching console.py behavior)."""
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.shutdown()
+            if event.type == pygame.KEYDOWN:
+                # State changes (priority)
+                if event.key == pygame.K_1 or event.key == pygame.K_i: 
+                    self.state = SimulationState.INIT
+                elif event.key == pygame.K_2 or event.key == pygame.K_m: 
+                    self.state = SimulationState.ACTIVE
+                # Incremental velocity commands (matching console.py ictp)
+                elif event.key == pygame.K_w:
+                    self.ref_base_lin_vel_H[0] += 0.2
+                elif event.key == pygame.K_s:
+                    self.ref_base_lin_vel_H[0] -= 0.1
+                elif event.key == pygame.K_a:
+                    self.ref_base_lin_vel_H[1] += 0.1
+                elif event.key == pygame.K_d:
+                    self.ref_base_lin_vel_H[1] -= 0.1
+                elif event.key == pygame.K_q:
+                    self.ref_base_ang_yaw_dot += 0.1
+                elif event.key == pygame.K_e:
+                    self.ref_base_ang_yaw_dot -= 0.1
+                elif event.key == pygame.K_0:
+                    # Stop all motion
+                    self.ref_base_lin_vel_H = np.zeros(3)
+                    self.ref_base_ang_yaw_dot = 0.0
+                elif event.key == pygame.K_z:
+                    # Pitch up
+                    self.pitch_delta -= 0.1
+                elif event.key == pygame.K_x:
+                    # Pitch down
+                    self.pitch_delta += 0.1
+                elif event.key == pygame.K_c:
+                    # Reset pitch
+                    self.pitch_delta = 0.0
+                elif event.key == pygame.K_j:
+                    # Toggle Jacobian diagnostics (only enable during ACTIVE state for meaningful data)
+                    if self.state == SimulationState.ACTIVE:
+                        self.run_jacobian_diagnostics = not self.run_jacobian_diagnostics
+                        status = "ENABLED" if self.run_jacobian_diagnostics else "DISABLED"
+                        print(f"[DogRunner] Jacobian diagnostics {status}")
+
+        # --- Convert body-frame velocity to world frame using current yaw ---
+        if hasattr(self, '_last_yaw'):
+            from scipy.spatial.transform import Rotation
+            R_yaw = Rotation.from_euler('z', self._last_yaw).as_matrix()
+            lin_vel_world = R_yaw @ self.ref_base_lin_vel_H
+        else:
+            lin_vel_world = self.ref_base_lin_vel_H
+
+        # Set MPC reference velocity with yaw rate
+        ang_vel_world = np.array([0.0, 0.0, self.ref_base_ang_yaw_dot])
+        self.mpc_controller.set_reference_velocity(lin_vel_world, ang_vel_world)
+        if hasattr(self.mpc_controller, 'set_reference_pitch_offset'):
+            self.mpc_controller.set_reference_pitch_offset(float(self.pitch_delta))
+
+        # Render UI
+        self.screen.fill((0, 0, 0))
+        if self.font:
+            c = (0, 255, 0) if self.state == SimulationState.ACTIVE else (255, 255, 0)
+            self.screen.blit(self.font.render(f"State: {self.state.name}", True, c), (10, 10))
+            
+            vel_txt = f"V: fwd={self.ref_base_lin_vel_H[0]:+.2f} lat={self.ref_base_lin_vel_H[1]:+.2f} yaw={self.ref_base_ang_yaw_dot:+.2f} pitch={self.pitch_delta:+.2f}"
+            self.screen.blit(self.small_font.render(vel_txt, True, (100, 200, 255)), (10, 35))
+            
+            help_txt = "1: INIT | 2: ACTIVE | W/S: Fwd/Back | A/D: Left/Right | Q/E: Rotate | 0: Stop | Z/X/C: Pitch"
+            self.screen.blit(self.small_font.render(help_txt, True, (200, 200, 200)), (10, 55))
+        pygame.display.flip()
+
+    def state_machine(self):
+        """Detects state changes and updates physics properties."""
+        # Auto-transition INIT → ACTIVE after a configured number of physics
+        # steps.  This lets headless / scripted runs proceed without a keypress.
+        if (
+            self.state == SimulationState.INIT
+            and self.auto_active_step is not None
+            and self.physics_step_counter >= self.auto_active_step
+        ):
+            print(f"[DogRunner] Auto-activating MPC at physics step {self.physics_step_counter}")
+            self.state = SimulationState.ACTIVE
+
+        if self.state != self.last_state:
+            print(f"[DogRunner] Switching State: {self.last_state.name} -> {self.state.name}")
+            if self.state == SimulationState.INIT:
+                self._set_dof_properties(self.initial_dof_props)
+            elif self.state == SimulationState.ACTIVE:
+                self._set_dof_properties(self.active_dof_props)
+            self.last_state = self.state
+
+    def get_states(self):
+        # print("[DEBUG] get_states top reached", flush=True)
+        # print(f"[DEBUG] leg_order: {self.leg_order}", flush=True)
+        # print(f"[DEBUG] foot_sensors keys: {list(self.dog.foot_sensors.keys())}", flush=True)
+        # for leg in self.leg_order:
+        #     sensor = self.dog.foot_sensors.get(leg)
+        #     print(f"[DEBUG] Sensor for {leg}: {sensor} (type: {type(sensor)})", flush=True)
+        # --- A. Root State ---
+        root_poses = self.dog.articulation.get_world_poses()
+        base_lin_vel = self.dog.articulation.get_linear_velocities()[0]
+        base_ang_vel = self.dog.articulation.get_angular_velocities()[0]
+        
+        sim_root_state_w = np.concatenate([
+            root_poses[0][0], 
+            root_poses[1][0], 
+            base_lin_vel, 
+            base_ang_vel
+        ], axis=0)
+        #print("[DEBUG] after root state", flush=True)
+        # --- B. Joint State ---
+        sim_pos = self.dog.articulation.get_joint_positions()[0]
+        sim_vel = self.dog.articulation.get_joint_velocities()[0]
+        current_pos_ctrl = np.zeros(self.num_ctrl_joints)
+        current_vel_ctrl = np.zeros(self.num_ctrl_joints)
+        current_pos_ctrl[self.valid_ctrl_mask] = sim_pos[self.valid_sim_indices]
+        current_vel_ctrl[self.valid_ctrl_mask] = sim_vel[self.valid_sim_indices]
+        #print("[DEBUG] after joint state", flush=True)
+        # --- C. Contact Sensors (FIXED) ---
+        sim_contact_list = np.zeros(4)
+        foot_forces = [0.0] * 4
+        for i, leg in enumerate(self.leg_order):
+            sensor = self.dog.foot_sensors.get(leg)
+            if sensor:
+                reading = sensor.get_current_frame()
+                if "force" in reading and reading["force"] is not None:
+                    force_data = reading["force"]
+                    foot_forces[i] = np.linalg.norm(force_data)
+            #print(f"[DEBUG] Leg {leg}: force_z={foot_forces[i]:.2f}", flush=True)
+        #print("[DEBUG] after contact sensors", flush=True)
+        # --- Contact Hysteresis + Debounce ---
+        for i in range(4):
+            if not self.contact_state[i]:
+                if foot_forces[i] > self.CONTACT_ON_THRESHOLD:
+                    self.contact_debounce[i] += 1
+                    if self.contact_debounce[i] >= self.CONTACT_DEBOUNCE_STEPS:
+                        self.contact_state[i] = True
+                        self.contact_debounce[i] = 0
+                        #print(f"[Contact] Leg {self.leg_order[i]}: CONTACT detected at force {foot_forces[i]:.2f} N (step {self.physics_step_counter})", flush=True)
+                else:
+                    self.contact_debounce[i] = 0
+            else:
+                if foot_forces[i] < self.CONTACT_OFF_THRESHOLD:
+                    self.contact_debounce[i] += 1
+                    if self.contact_debounce[i] >= self.CONTACT_DEBOUNCE_STEPS:
+                        self.contact_state[i] = False
+                        self.contact_debounce[i] = 0
+                        #print(f"[Contact] Leg {self.leg_order[i]}: CONTACT LOST at force {foot_forces[i]:.2f} N (step {self.physics_step_counter})", flush=True)
+                else:
+                    self.contact_debounce[i] = 0
+            sim_contact_list[i] = 1.0 if self.contact_state[i] else 0.0
+            #print(f"[DEBUG] Leg {self.leg_order[i]}: contact_state={self.contact_state[i]}, gait_phase={self.gait_phase[i]}", flush=True)
+        #print("[DEBUG] after contact hysteresis", flush=True)
+        # --- Hybrid Contact Override: Use measured contact to override planned gait phase ---
+        # for i in range(4):
+        #     if self.gait_phase[i] == 'swing' and self.contact_state[i]:
+        #         print(f"[Override] Leg {self.leg_order[i]}: Early touchdown, forcing STANCE (step {self.physics_step_counter})", flush=True)
+        #         self.gait_phase[i] = 'stance'
+        #     elif self.gait_phase[i] == 'stance' and not self.contact_state[i]:
+        #         print(f"[Override] Leg {self.leg_order[i]}: Lost contact, forcing SWING (step {self.physics_step_counter})", flush=True)
+        #         self.gait_phase[i] = 'swing'
+        # print("[DEBUG] after hybrid override", flush=True)
+        # --- D. Rigid Body Poses (Feet/Hips) ---
+        body_poses_np_pos = {}
+        body_vels_np_lin = {}
+        
+        for name in self.body_names_of_interest:
+            idx = self.body_indices.get(name, -1)
+            handle = self._dc.get_articulation_body(self.art_handle, idx)
+            if handle != _dynamic_control.INVALID_HANDLE:
+                body_poses_np_pos[name] = self._dc.get_rigid_body_pose(handle).p
+                body_vels_np_lin[name] = self._dc.get_rigid_body_linear_velocity(handle)
+            else:
+                body_poses_np_pos[name] = np.zeros(3)
+                body_vels_np_lin[name] = np.zeros(3)
+        # Cache last body poses for raycast exclusion logic (used by the raycast closure)
+        try:
+            self._last_body_poses = body_poses_np_pos.copy()
+        except Exception:
+            self._last_body_poses = body_poses_np_pos
+        return {
+            "sim_root_state_w": sim_root_state_w,
+            "current_pos_ctrl": current_pos_ctrl,
+            "current_vel_ctrl": current_vel_ctrl,
+            "sim_contact_list": sim_contact_list,
+            "foot_forces": np.asarray(foot_forces, dtype=np.float64),
+            "sim_pos": sim_pos, 
+            "sim_vel": sim_vel,
+            "body_poses_np_pos": body_poses_np_pos, 
+            "body_vels_np_lin": body_vels_np_lin
+        }
+
+    def _compute_dynamics(self, states):
+        """Calculates Mass Matrix, Bias, and Jacobians."""
+        # Unpack
+        sim_root_state_w = states['sim_root_state_w']
+        body_poses_np_pos = states['body_poses_np_pos']
+        body_vels_np_lin = states['body_vels_np_lin']
+        
+        # 2. Rotation Matrix (Quat -> Mat)
+        quat_wxyz = sim_root_state_w[3:7]
+        quat_xyzw = np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]])
+        R = Rotation.from_quat(quat_xyzw).as_matrix()
+
+        # 3. Raw Dynamics from DC
+        mass_full = self.dog.articulation.get_mass_matrices()[0]
+        coriolis_full = self.dog.articulation.get_coriolis_and_centrifugal_forces()[0]
+        jac_full = self.dog.articulation.get_jacobians()[0]
+
+        # 4. Map Mass/Bias to Controller Indices
+        ctrl_dof_indices = self.valid_sim_indices + self.dof_offset
+        
+        mass_ctrl = np.zeros((self.num_ctrl_joints, self.num_ctrl_joints))
+        valid_dof_mask = ctrl_dof_indices < mass_full.shape[0]
+        safe_sim_indices = ctrl_dof_indices[valid_dof_mask]
+        safe_ctrl_mask = self.valid_ctrl_mask[valid_dof_mask]
+        
+        mass_ctrl[np.ix_(safe_ctrl_mask, safe_ctrl_mask)] = \
+            mass_full[np.ix_(safe_sim_indices, safe_sim_indices)]
+
+        bias_ctrl = np.zeros(self.num_ctrl_joints)
+        bias_ctrl[self.valid_ctrl_mask] = coriolis_full[self.valid_sim_indices]
+
+        base_inertia_3x3 = mass_full[3:6, 3:6] if mass_full.shape[0] >= 6 else np.eye(3)
+
+        # 5. Jacobian Transformation (Isaac provides in world frame)
+        feet_jac = np.zeros((4, 3, self.num_ctrl_joints + self.dof_offset))
+        feet_jac_raw = np.zeros((4, 3, jac_full.shape[2]))
+        joint_col_indices = np.where(safe_ctrl_mask)[0] + self.dof_offset
+
+        for i, leg in enumerate(self.leg_order):
+            body_idx = self.body_indices.get(f'{leg}_foot', -1)
+            if body_idx == -1: continue
+
+            jac_isaac = jac_full[body_idx, 0:3, :]  # Extract position Jacobian (world frame)
+            feet_jac_raw[i] = jac_isaac
+            
+            # NOTE: Isaac Jacobian is already in the form J_world where J_world @ q_dot = v_foot_world
+            # We use it directly without frame transformation
+            jac_transformed = jac_isaac
+            
+            jac_out = np.zeros((3, self.num_ctrl_joints + self.dof_offset))
+            jac_out[:, 0:self.dof_offset] = jac_transformed[:, 0:self.dof_offset]
+            jac_out[:, joint_col_indices] = jac_transformed[:, safe_sim_indices] 
+            feet_jac[i] = jac_out
+
+        # 6. J_dot calculation
+        if self.debug_counter > 1: # TODO REMOVE COUNTER MADNASS 
+            self.feet_jac_dot_ctrl = (feet_jac - self.last_feet_jac) / self.sim_dt
+        self.last_feet_jac = feet_jac
+        # 7. Organize flattened lists for feet/hips (Restoring 'feet_pos_w', etc)
+        feet_pos_w = np.concatenate([body_poses_np_pos[f'{l}_foot'] for l in self.leg_order])
+        feet_vel_w = np.concatenate([body_vels_np_lin[f'{l}_foot'] for l in self.leg_order])
+        hip_pos_w = np.concatenate([body_poses_np_pos[f'{l}_hip'] for l in self.leg_order])
+
+        return {
+            "mass_ctrl": mass_ctrl,
+            "bias_ctrl": bias_ctrl,
+            "base_inertia_3x3": base_inertia_3x3,
+            "feet_jac": feet_jac,
+            "feet_jac_raw": feet_jac_raw,
+            "feet_jac_dot": self.feet_jac_dot_ctrl,
+            "feet_pos_w": feet_pos_w,
+            "feet_vel_w": feet_vel_w,
+            "hip_pos_w": hip_pos_w,
+        }
+
+    def _get_controller_torques(self, state_data, quat_xyzw, dynamics):
+        """Routes to the correct controller based on state and execution mode."""
+        torques_ctrl = None
+        
+        if self.state == SimulationState.INIT:
+            torques_ctrl = self.standing_controller.get_torques(
+                state_data['joint_pos_ctrl'], 
+                state_data['joint_vel_ctrl']
+            )
+        elif self.state == SimulationState.ACTIVE:
+            try:
+                # If configured to use standing controller for the startup period,
+                # prefer standing torques for the first N physics steps to avoid
+                # aggressive MPC-derived spikes while the system is settling.
+                if hasattr(self, 'startup_use_standing') and hasattr(self, 'startup_torque_scale_steps'):
+                    if int(self.physics_step_counter) < int(max(0, self.startup_torque_scale_steps)):
+                        torques_ctrl = self.standing_controller.get_torques(
+                            state_data['joint_pos_ctrl'], 
+                            state_data['joint_vel_ctrl']
+                        )
+                        self.last_torques = torques_ctrl
+                        # Skip MPC path for this step
+                        return torques_ctrl
+                if self.using_ros:
+                    # ROS-based control: publish state and wait for torques
+                    self.mpc_controller.publish_state(state_data)
+                    # Get action synchronously (with timeout)
+                    torques_ctrl = self.mpc_controller.get_action(
+                        target_timestamp=state_data.get('timestamp', None)
+                    )
+                    pd_targets = self.mpc_controller.get_pd_targets()
+                    if pd_targets is not None and torques_ctrl is not None:
+                        q_des, qd_des, kp, kd = pd_targets
+                        q = state_data['joint_pos_ctrl']
+                        qd = state_data['joint_vel_ctrl']
+                        tau_pd = kp * (q_des - q) + kd * (qd_des - qd)
+                        torques_ctrl = torques_ctrl + tau_pd
+                else:
+                    # Direct Isaac Sim MPC: call synchronously
+                    self._apply_rl_residual_policy()
+                    root_state = state_data['root_state_w']
+                    torques_ctrl, debug_info = self.mpc_controller.compute_control(
+                        position=root_state[0:3],
+                        orientation_quat_xyzw=quat_xyzw,
+                        linear_velocity=root_state[7:10],
+                        angular_velocity=root_state[10:13],
+                        joint_positions=state_data['joint_pos_ctrl'],
+                        joint_velocities=state_data['joint_vel_ctrl'],
+                        feet_positions=state_data['feet_pos_w'],
+                        hip_positions=state_data['hip_pos_w'],
+                        contact_forces=state_data.get('foot_forces', state_data['contact_list']),
+                        mass_matrix=dynamics['mass_ctrl'],
+                        bias_forces=dynamics['bias_ctrl'],
+                        feet_jacobians=dynamics['feet_jac'],
+                        feet_jacobian_dots=dynamics['feet_jac_dot'],
+                        feet_velocities=dynamics['feet_vel_w'],
+                        inertia=dynamics['base_inertia_3x3'],
+                        simulation_dt=self.sim_dt,
+                    )
+                    try:
+                        self.last_mpc_debug_info = debug_info if isinstance(debug_info, dict) else {}
+                        if int(self.physics_step_counter) % int(max(1, self.mpc_diag_print_interval)) == 0:
+                            mpc_diag = self.last_mpc_debug_info.get('mpc_diag', {})
+                            if isinstance(mpc_diag, dict):
+                                print(
+                                    "[DogRunner MPC] step={} status={} tau_max={:.2f} sat={:.2f} dt={:.2f}ms".format(
+                                        int(self.physics_step_counter),
+                                        int(mpc_diag.get('solve_status', -999)),
+                                        float(mpc_diag.get('torque_max_abs', 0.0)),
+                                        float(mpc_diag.get('torque_sat_ratio', 0.0)),
+                                        float(mpc_diag.get('compute_duration_ms', 0.0)),
+                                    )
+                                )
+                    except Exception:
+                        pass
+                
+                self.last_torques = torques_ctrl
+                if torques_ctrl is None:
+                    print("[DogRunner] MPC did not return torques.")
+                    raise ValueError("MPC returned None")
+            except Exception as e:
+                print(f"[DogRunner] Error in MPC computation: {e}")
+                torques_ctrl = self.last_torques if self.last_torques is not None else None
+
+        # Safety: during the early physics steps, optionally scale down torques
+        # if the runner was configured with startup torque scaling knobs.
+        try:
+            if (torques_ctrl is not None) and hasattr(self, 'startup_torque_scale_steps') and hasattr(self, 'startup_torque_scale'):
+                if int(self.physics_step_counter) < int(max(0, self.startup_torque_scale_steps)):
+                    scale = float(np.clip(self.startup_torque_scale, 0.0, 1.0))
+                    # scale torques (numpy array)
+                    try:
+                        torques_ctrl = np.asarray(torques_ctrl, dtype=np.float64) * float(scale)
+                        # keep last_torques consistent
+                        self.last_torques = torques_ctrl
+                        print(f"[DogRunner] Startup torque scaling applied (scale={scale}) at step {self.physics_step_counter}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        
+        return torques_ctrl
+
+    def _map_torques_to_sim(self, torques_ctrl):
+        """Maps controller torques back to simulation indices."""
+        self.torques_sim = np.zeros(self.num_sim_dofs)
+        
+        if torques_ctrl is None: return
+
+        if len(torques_ctrl) >= np.count_nonzero(self.valid_ctrl_mask):
+            valid_torques = torques_ctrl[self.valid_ctrl_mask]
+            self.torques_sim[self.valid_sim_indices] = valid_torques
+
+    def _run_jacobian_diagnostic(self, state_data, dynamics):
+        """Run Jacobian validation tests and report failures."""
+        # Import here to access in this method's scope
+        import sys
+        jacobian_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+        if jacobian_path not in sys.path:
+            sys.path.insert(0, jacobian_path)
+        from jacobian_diagnostic import JacobianDiagnostic
+        
+        feet_jac_isaac = dynamics['feet_jac']  # Shape: (4, 3, 12+6)
+        feet_vel_w = dynamics['feet_vel_w']  # Shape: (12,) flattened feet velocities
+        feet_jac_raw = dynamics.get('feet_jac_raw')
+        joint_vel_ctrl = state_data['joint_vel_ctrl']  # Shape: (12,)
+        root_state = state_data['root_state_w']
+        
+        # Update diagnostic object (clear previous)
+        self.jacobian_diagnostic = JacobianDiagnostic()
+        
+        # Extract Jacobian derivatives
+        feet_jac_dot_isaac = dynamics['feet_jac_dot']  # Shape: (4, 3, 12+6)
+        
+        # Test each leg's Jacobian
+        leg_order = ['FL', 'FR', 'RL', 'RR']
+        all_passed = True
+        
+        # DEBUG: Print on first failure
+        debug_once = True
+        
+        for i, leg in enumerate(leg_order):
+            J = feet_jac_isaac[i]  # Shape: (3, 18) = (3 pos DOFs, 6 base + 12 joint)
+            J_dot = feet_jac_dot_isaac[i]  # Same shape
+            J_joints = J[:, self.dof_offset:]  # Joint Jacobian: (3, 12)
+            J_dot_joints = J_dot[:, self.dof_offset:]  # Same shape
+            
+            # Get measured foot velocity for this leg
+            foot_vel_idx = slice(i*3, (i+1)*3)
+            foot_vel_measured_world = feet_vel_w[foot_vel_idx]  # In world frame
+            
+            # Compute predicted foot velocity from base + joints (world frame)
+            root_lin_vel = root_state[7:10]
+            root_ang_vel = root_state[10:13]
+            base_state = np.concatenate([root_lin_vel, root_ang_vel])
+            q_dot_full = np.concatenate([base_state, joint_vel_ctrl])
+            foot_vel_predicted_world = J @ q_dot_full
+            
+            # DEBUG: Print detailed info on first leg
+            if debug_once and i == 0:
+                print(f"\n[DiagnosticDebug] Step {self.physics_step_counter}")
+                print(f"  Q_dot norm: {np.linalg.norm(joint_vel_ctrl):.6f}")
+                print(f"  J_joints shape: {J_joints.shape}")
+                print(f"  {leg}_foot vel_world (measured): {foot_vel_measured_world}")
+                print(f"  {leg}_foot vel_world_predicted (J@qdot): {foot_vel_predicted_world}")
+                print(f"  Difference: {foot_vel_predicted_world - foot_vel_measured_world}")
+                debug_once = False
+            
+            # Test 1: Forward Kinematics Consistency (world frame, base + joints)
+            passed_fk = self.jacobian_diagnostic.test_forward_kinematics_consistency(
+                J, J_dot, q_dot_full, foot_vel_measured_world, leg,
+                tolerance=0.1  # 10 cm/s tolerance
+            )
+
+            all_passed = all_passed and passed_fk
+            
+            # Test 4: Rank and Conditioning
+            passed_rank = self.jacobian_diagnostic.test_jacobian_rank_and_condition(
+                J_joints, leg, expected_rank=3
+            )
+            all_passed = all_passed and passed_rank
+
+            # Test 5: Joint mapping correctness (if raw Jacobian is available)
+            if feet_jac_raw is not None:
+                J_raw = feet_jac_raw[i]
+                ctrl_dof_indices = self.valid_sim_indices + self.dof_offset
+                valid_dof_mask = ctrl_dof_indices < J_raw.shape[1]
+                safe_sim_indices = ctrl_dof_indices[valid_dof_mask]
+                safe_ctrl_mask = self.valid_ctrl_mask[valid_dof_mask]
+                mapped_joint_indices = np.where(safe_ctrl_mask)[0] + self.dof_offset
+                passed_mapping = self.jacobian_diagnostic.test_joint_mapping_correctness(
+                    J_raw, J, safe_sim_indices, mapped_joint_indices, leg
+                )
+                all_passed = all_passed and passed_mapping
+                if not passed_mapping:
+                    print(f"  [DEBUG] {leg} mapping failed: check valid_sim_indices order")
+        
+        # Print summary every diagnostic_interval
+        if self.diagnostic_counter % (self.diagnostic_interval * 5) == 0:
+            self.jacobian_diagnostic.print_summary()
+        
+        if not all_passed:
+            print(f"\n⚠️  [DogRunner] Jacobian diagnostic failures detected at step {self.physics_step_counter}")
+        
+        self.diagnostic_counter += 1
+
+    def shutdown(self):
+        print("[DogRunner] Shutting down...")
+        pygame.quit()
+        sys.exit(0)

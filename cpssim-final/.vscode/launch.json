@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch: Isaac Sim (go2_pympc.py)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/IsaacLabFromTemu/go2_pympc.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "/home/mena/miniconda3/envs/pympc/bin/python",
+      "env": {
+        "PYTHONPATH": "/home/mena/isaac_sim/python/lib/python3.11/site-packages:/home/mena/isaac_sim/exts:/home/mena/isaac_sim/exts/omni.isaac.core/lib/python3.11/site-packages:/home/mena/pympc/ros2/msgs_ws/install/dls2_msgs/lib/python3.11/site-packages:/home/mena/miniconda3/envs/pympc/lib/python311/site-packages:/home/mena/miniconda3/envs/pympc/lib/python3.11/site-packages:/home/mena/IsaacSim-ros_workspaces/build_ws/humble/isaac_sim_ros_ws/install/isaac_ros_navigation_goal/lib/python3.11/site-packages:/home/mena/IsaacSim-ros_workspaces/build_ws/humble/isaac_sim_ros_ws/install/isaac_ros2_messages/local/lib/python3.11/dist-packages:/home/mena/IsaacSim-ros_workspaces/build_ws/humble/isaac_sim_ros_ws/install/custom_message/local/lib/python3.11/dist-packages:/home/mena/IsaacSim-ros_workspaces/build_ws/humble/humble_ws/install/local/lib/python3.11/dist-packages:/home/mena/IsaacSim-ros_workspaces/build_ws/humble/humble_ws/install/lib/python3.11/site-packages:${env:PYTHONPATH}",
+        "LD_LIBRARY_PATH": "/home/mena/isaac_sim/_build/linux-x86_64/release:/home/mena/isaac_sim/python/lib:/home/mena/pympc/ros2/msgs_ws/install/dls2_msgs/lib:/home/mena/miniconda3/envs/pympc/opt/rviz_ogre_vendor/lib:/home/mena/IsaacSim-ros_workspaces/build_ws/humble/isaac_sim_ros_ws/install/isaac_ros2_messages/lib:/home/mena/IsaacSim-ros_workspaces/build_ws/humble/isaac_sim_ros_ws/install/custom_message/lib:/home/mena/IsaacSim-ros_workspaces/build_ws/humble/humble_ws/install/lib::/home/mena/pympc/quadruped_pympc/acados/lib:${env:LD_LIBRARY_PATH}"
+      },
+      "justMyCode": false,
+      "subProcess": true
+    },
+    {
+      "name": "Attach: debugpy (port 5678)",
+      "type": "python",
+      "request": "attach",
+      "connect": { "host": "localhost", "port": 5678 },
+      "justMyCode": false
+    }
+  ]
+}

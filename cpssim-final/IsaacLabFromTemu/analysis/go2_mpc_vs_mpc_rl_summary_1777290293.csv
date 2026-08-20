@@ -1,0 +1,3 @@
+case,episode_idx,course_success,course_complete,goal_crossed,completion_time_s,strict_completion_time_s,mean_tracking_error,mean_cmd_speed_nominal,mean_actual_speed_nominal,mean_swing_time_s,total_steps
+mpc_only,0,0.0,0.0,0.0,nan,nan,0.3983901758470202,0.8910653753026635,0.494053188499914,0.20000000000000004,2065
+mpc_rl,0,0.0,0.0,0.0,nan,nan,0.3791995639559907,0.8880890897353132,0.5090079488421414,0.19814827182071507,1549

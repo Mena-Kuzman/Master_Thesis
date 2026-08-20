@@ -1,0 +1,44 @@
+rosbag2_bagfile_information:
+  version: 5
+  storage_identifier: sqlite3
+  duration:
+    nanoseconds: 22781762497
+  starting_time:
+    nanoseconds_since_epoch: 1762864616424370118
+  message_count: 13138
+  topics_with_message_count:
+    - topic_metadata:
+        name: /dls2/base_state
+        type: dls2_msgs/msg/BaseStateMsg
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 3\n  depth: 0\n  reliability: 1\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 5839
+    - topic_metadata:
+        name: /dls2/blind_state
+        type: dls2_msgs/msg/BlindStateMsg
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 3\n  depth: 0\n  reliability: 1\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 5839
+    - topic_metadata:
+        name: /dls2/quadruped_pympc_torques
+        type: dls2_msgs/msg/ControlSignalMsg
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 3\n  depth: 0\n  reliability: 1\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 730
+    - topic_metadata:
+        name: /dls2/trajectory_generator
+        type: dls2_msgs/msg/TrajectoryGeneratorMsg
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 3\n  depth: 0\n  reliability: 1\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 730
+  compression_format: ""
+  compression_mode: ""
+  relative_file_paths:
+    - isaac_seated_high_freq_0.db3
+  files:
+    - path: isaac_seated_high_freq_0.db3
+      starting_time:
+        nanoseconds_since_epoch: 1762864616424370118
+      duration:
+        nanoseconds: 22781762497
+      message_count: 13138

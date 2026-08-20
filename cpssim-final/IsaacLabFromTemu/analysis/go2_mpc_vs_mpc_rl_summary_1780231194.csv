@@ -1,0 +1,2 @@
+terrain,command_forward,stair_step_height,case,episode_idx,course_success,course_complete,goal_crossed,completion_time_s,strict_completion_time_s,mean_tracking_error,mean_cmd_speed_nominal,mean_actual_speed_nominal,mean_swing_time_s,mean_cot,total_steps
+random_stairs,0.5,0.12,mpc_rl,0,1.0,1.0,1.0,26.018,26.018,0.08147235498722968,0.4992120839418864,0.43452396813553595,0.20383728500827678,2.5883425126615354,13009

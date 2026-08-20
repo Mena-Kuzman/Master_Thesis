@@ -1,0 +1,87 @@
+digraph G {
+    rankdir=TB;
+    node [shape=box, style=filled, fillcolor=white, fontname="Helvetica"];
+    edge [fontname="Helvetica", fontsize=10];
+    compound=true;
+    fontname="Helvetica";
+    bgcolor="transparent";
+
+    subgraph cluster_isaac {
+        label = "Isaac Lab Simulation (Process 1)";
+        style=filled;
+        fillcolor="#e1f5fe";
+        color="#01579b";
+        
+        entry [label="go2_pympc.py", shape=ellipse, style=filled, fillcolor="#b3e5fc"];
+        dog_runner [label="DogRunner\n(src/dog/dog_runner.py)"];
+        ros_mpc [label="RosMpcController\n(src/dog/RosMpcController.py)"];
+        
+        entry -> dog_runner [label="Initializes"];
+        dog_runner -> ros_mpc [label="Instantiates"];
+    }
+
+    subgraph cluster_ros {
+        label = "ROS 2 Communication Layer";
+        style=filled;
+        fillcolor="#fff3e0";
+        color="#e65100";
+        
+        topics [label="ROS Topics\n\n/dls2/base_state\n/dls2/blind_state\n/dls2/quadruped_pympc_torques", shape=note, style=filled, fillcolor="#ffe0b2"];
+    }
+
+    subgraph cluster_pympc {
+        label = "PyMPC Controller (Process 2)";
+        style=filled;
+        fillcolor="#e8f5e9";
+        color="#1b5e20";
+        
+        controller_entry [label="run_controller_isaac.py", shape=ellipse, style=filled, fillcolor="#c8e6c9"];
+        pympc_node [label="Quadruped_PyMPC_Node"];
+        
+        subgraph cluster_wb {
+            label = "Whole Body Interface";
+            style=dashed;
+            color="#2e7d32";
+            
+            wb_interface [label="WBInterface\n(interfaces/wb_interface.py)"];
+            pgg [label="PeriodicGaitGenerator"];
+            frg [label="FootholdReferenceGenerator"];
+            stc [label="SwingTrajectoryController"];
+            te [label="TerrainEstimator"];
+            vm [label="VelocityModulator"];
+            esd [label="EarlyStanceDetector"];
+            vfa [label="VisualFootholdAdaptation\n(Optional)"];
+            
+            wb_interface -> pgg;
+            wb_interface -> frg;
+            wb_interface -> stc;
+            wb_interface -> te;
+            wb_interface -> vm;
+            wb_interface -> esd;
+            wb_interface -> vfa [style=dotted];
+        }
+        
+        subgraph cluster_mpc {
+            label = "MPC Implementation";
+            style=dashed;
+            color="#2e7d32";
+            
+            srbd [label="SRBDControllerInterface\n(interfaces/srbd_controller_interface.py)"];
+            lyapunov [label="Acados_NMPC_Lyapunov\n(controllers/.../centroidal_nmpc_lyapunov.py)"];
+            solver [label="Acados Solver\n(C-Code)"];
+            
+            srbd -> lyapunov;
+            lyapunov -> solver;
+        }
+        
+        controller_entry -> pympc_node;
+        pympc_node -> wb_interface;
+        pympc_node -> srbd;
+    }
+
+    ros_mpc -> topics [label="Publishes State", style=dashed, color="#ef6c00"];
+    topics -> ros_mpc [label="Subscribes Torques", style=dashed, color="#ef6c00"];
+    
+    topics -> pympc_node [label="Subscribes State", style=dashed, color="#ef6c00"];
+    pympc_node -> topics [label="Publishes Torques", style=dashed, color="#ef6c00"];
+}
