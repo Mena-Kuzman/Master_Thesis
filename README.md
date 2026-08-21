@@ -8,7 +8,7 @@ The addition of the RL agent allows the robot to dynamically adapt its step heig
 
 | Baseline (Standard NMPC) | RL-Augmented MPC (Our Approach) |
 | :---: | :---: |
-| ![Baseline Performance](Baseline_MPC.gif) | ![RL-Augmented Performance](MPC_RL.gif) |
+| <img src="Baseline_MPC.gif" width="400" alt="Baseline Standard NMPC" /> | <img src="MPC_RL.gif" width="400" alt="RL Augmented MPC" /> |
 | *Robot struggles with fixed gait timings and rigid trajectory planning on stairs.* | *Robot successfully adapts step height and swing time dynamically via SAC policy.* |
 
 ---
@@ -17,7 +17,7 @@ The addition of the RL agent allows the robot to dynamically adapt its step heig
 
 The control framework is split into two distinct loops: a **High-Level RL Agent** running at a lower frequency for adaptive planning, and a **Low-Level Model-Based Controller** running at high frequency for precise dynamic execution. The entire system is validated using **NVIDIA Isaac Sim**.
 
-![Control Architecture](Hybrid_arch.png)
+<img src="Hybrid_arch.jpg" width="800" alt="Control Architecture Diagram" />
 
 ### 1. High-Level Control (Reinforcement Learning)
 The high-level policy is trained using a **Soft Actor-Critic (SAC)** algorithm via PyTorch. 
@@ -38,7 +38,6 @@ The low-level controller processes the RL agent's high-level adjustments and tra
 * **Simulation:** NVIDIA Isaac Sim
 * **Machine Learning:** Python, PyTorch (SAC Implementation)
 * **Optimal Control:** CasADi (Nonlinear MPC formulation)
-* **Robotics Middleware:** ROS 2 (for data logging and future physical deployment)
 * **OS:** Ubuntu 22.04 LTS (Linux)
 
 ---
