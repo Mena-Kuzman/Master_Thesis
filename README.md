@@ -4,12 +4,12 @@ This repository contains the code and simulation environment for my Master's the
 
 ## 🚀 Performance Comparison: Standard MPC vs. RL-Augmented MPC
 
-The addition of the RL agent allows the robot to dynamically adapt its step height, swing time, and body pitch to overcome obstacles that a standard model-based controller fails to navigate.
+The addition of the RL agent allows the robot to dynamically adapt its step height and swing time to overcome obstacles that a standard model-based controller fails to navigate.
 
 | Baseline (Standard NMPC) | RL-Augmented MPC (Our Approach) |
 | :---: | :---: |
-| ![Baseline Performance](image_4d8906.jpg) | ![RL-Augmented Performance](image_4d895b.jpg) |
-| *Robot struggles with fixed gait timings and rigid trajectory planning on stairs.* | *Robot successfully adapts step height and pitch dynamically via SAC policy.* |
+| ![Baseline Performance](Baseline_MPC.gif) | ![RL-Augmented Performance](MPC_RL.gif) |
+| *Robot struggles with fixed gait timings and rigid trajectory planning on stairs.* | *Robot successfully adapts step height and swing time dynamically via SAC policy.* |
 
 ---
 
@@ -17,12 +17,12 @@ The addition of the RL agent allows the robot to dynamically adapt its step heig
 
 The control framework is split into two distinct loops: a **High-Level RL Agent** running at a lower frequency for adaptive planning, and a **Low-Level Model-Based Controller** running at high frequency for precise dynamic execution. The entire system is validated using **NVIDIA Isaac Sim**.
 
-![Control Architecture](image_4d8ca0.jpg)
+![Control Architecture](Hybrid_arch.png)
 
 ### 1. High-Level Control (Reinforcement Learning)
 The high-level policy is trained using a **Soft Actor-Critic (SAC)** algorithm via PyTorch. 
 * **Inputs:** Current robot states, foot contacts, and user velocity/yaw commands.
-* **Outputs:** It continuously outputs a **Pitch Residual**, alongside **Adaptive Step Height** and **Swing Time** adjustments to handle uneven terrain.
+* **Outputs:** It continuously outputs an **Adaptive Step Height** and **Swing Time** adjustments to handle uneven terrain.
 
 ### 2. Low-Level Control (Model-Based Execution)
 The low-level controller processes the RL agent's high-level adjustments and translates them into physical joint torques:
