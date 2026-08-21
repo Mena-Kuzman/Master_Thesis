@@ -17,7 +17,7 @@ The addition of the RL agent allows the robot to dynamically adapt its step heig
 
 The control framework is split into two distinct loops: a **High-Level RL Agent** running at a lower frequency for adaptive planning, and a **Low-Level Model-Based Controller** running at high frequency for precise dynamic execution. The entire system is validated using **NVIDIA Isaac Sim**.
 
-<img src="Hybrid_arch.jpg" width="800" alt="Control Architecture Diagram" />
+<img src="Hybrid_arch.png" width="800" alt="Control Architecture Diagram" />
 
 ### 1. High-Level Control (Reinforcement Learning)
 The high-level policy is trained using a **Soft Actor-Critic (SAC)** algorithm via PyTorch. 
