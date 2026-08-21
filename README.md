@@ -41,10 +41,3 @@ The low-level controller processes the RL agent's high-level adjustments and tra
 * **OS:** Ubuntu 22.04 LTS (Linux)
 
 ---
-
-## 💻 Installation & Quick Start
-
-### 1. Clone the repository
-```bash
-git clone [https://github.com/Mena-Kuzman/rl-augmented-mpc-quadruped.git](https://github.com/Mena-Kuzman/rl-augmented-mpc-quadruped.git)
-cd rl-augmented-mpc-quadruped
