@@ -8,7 +8,7 @@ The addition of the RL agent allows the robot to dynamically adapt its step heig
 
 | Baseline (Standard NMPC) | RL-Augmented MPC (Our Approach) |
 | :---: | :---: |
-| <img src="Baseline_MPC.gif" width="400" alt="Baseline Standard NMPC" /> | <img src="MPC_RL.gif" width="400" alt="RL Augmented MPC" /> |
+| <img src="BaselineMPC.gif" width="400" alt="Baseline Standard NMPC" /> | <img src="MPC_RL.gif" width="400" alt="RL Augmented MPC" /> |
 | *Robot struggles with fixed gait timings and rigid trajectory planning on stairs.* | *Robot successfully adapts step height and swing time dynamically via SAC policy.* |
 
 ---
