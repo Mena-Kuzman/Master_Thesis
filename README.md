@@ -12,7 +12,7 @@ Adding the high-level RL policy enables the quadruped to dynamically adapt its s
 
 | Baseline (Standard SRBD NMPC) | RL-Augmented NMPC (Proposed Approach) |
 | :---: | :---: |
-|  |  |
+| <img src="BaselineMPC.gif" width="400" alt="Baseline Standard NMPC" /> | <img src="MPC+RL.gif" width="400" alt="RL Augmented MPC" /> |
 | *Robot struggles with fixed gait timings and rigid foot-swing trajectories on stairs.* | *Robot dynamically adapts step height and swing duration via the PyTorch SAC policy.* |
 
 ## System Architecture
