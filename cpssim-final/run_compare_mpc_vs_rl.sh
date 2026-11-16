@@ -3,7 +3,7 @@
 
 export LD_LIBRARY_PATH="/home/mena/miniconda3/envs/pympc/lib:$LD_LIBRARY_PATH"
 
-cd /home/mena/cpssim3/cpssim/IsaacLabFromTemu
+cd /home/mena/cpssim3/cpssim/rl_sac_planner
 
 # Default to a known completed parallel trial checkpoint unless user provides --checkpoint.
 DEFAULT_TRIAL_ID="1777120627"  #1777120627    1778755326

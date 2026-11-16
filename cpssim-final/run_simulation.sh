@@ -5,5 +5,5 @@
 export LD_LIBRARY_PATH="/home/mena/miniconda3/envs/pympc/lib:$LD_LIBRARY_PATH"
 
 # Change to Isaac Lab directory and run the simulation
-cd /home/mena/cpssim2/IsaacLabFromTemu
+cd /home/mena/cpssim2/rl_sac_planner
 python3 go2_pympc.py "$@"

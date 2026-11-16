@@ -2,7 +2,7 @@
 # Run the procedural two-checkpoint MPC+RL comparison with the same runtime library setup as run_simulation.sh
 export LD_LIBRARY_PATH="/home/mena/miniconda3/envs/pympc/lib:$LD_LIBRARY_PATH"
 
-cd /home/mena/cpssim3/cpssim/IsaacLabFromTemu
+cd /home/mena/cpssim3/cpssim/rl_sac_planner
 
 DEFAULT_CHECKPOINT_A="/home/mena/cpssim3/cpssim/checkpoints/sac_step_height_residual_parallel_seed1_1778755326_final.pt"
 DEFAULT_CHECKPOINT_B="/home/mena/cpssim3/cpssim/checkpoints/sac_step_height_residual_parallel_seed1_1777120627_final.pt"
